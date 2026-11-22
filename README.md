@@ -1,11 +1,5 @@
-# VK3FS Beacon Strength Plotter
+VK3FS Beacon Strength Plotter is a Windows program for monitoring and recording amateur radio beacon signals from Icom transceivers via CI-V. Plot live S-meter readings in S-units or estimated dBm, review signal history, and export readings to CSV.
 
-Watch the receive signal from an Icom CI-V radio on Windows 10 or 11. Record and review beacon signals, manage presets, and view the path and ground elevation to a beacon.
+[Download the Windows installer](https://github.com/AM3FS/Beacon-Strength-Plotter/releases/latest)
 
-- [Windows installer](https://github.com/AM3FS/Beacon-Strength-Plotter/releases)
-- [Quick start](docs/Beacon-Plotter-Quick-Start.pdf)
-- [Operating guide](docs/Beacon-Plotter-Operating-Guide.pdf)
-
-Select **Setup → Check for updates** to check GitHub for a newer stable release and download its installer.
-
-The [maintainer release checklist](RELEASE.md) covers building and publishing. [Source and data notes](README.txt) include CI-V and map-data references.
+![Beacon Strength Plotter on Windows showing a live IC-9700 signal trace in dBm](beacon-strength-plotter.png)
