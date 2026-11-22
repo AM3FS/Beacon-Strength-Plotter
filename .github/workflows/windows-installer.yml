@@ -1,0 +1,49 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Build Windows application
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt "pyinstaller>=6,<7"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m PyInstaller --noconfirm --onefile --windowed --icon radio_tower.ico `
+            --add-data "radio_tower.ico;." --add-data "beacon_background_day.png;." `
+            --add-data "beacon_background_night.png;." --add-data "OpenSans-Bold.ttf;." `
+            --add-data "OpenSans-LICENSE.txt;." --add-data "station_countries.json;." `
+            --name "Icom S-meter Plotter" plotter.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Compile and verify installer
+        shell: pwsh
+        run: |
+          $version = python -c "from updates import APP_VERSION; print(APP_VERSION)"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler missing from the runner" }
+          & $iscc "/DAppVersion=$version" installer/BeaconPlotter.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $installer = Resolve-Path 'installer-output/VK3FS-Beacon-Strength-Plotter-Setup.exe'
+          $smoke = Join-Path $env:RUNNER_TEMP 'BeaconPlotterInstallerTest'
+          $installed = Start-Process $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$smoke`"" -PassThru -Wait
+          if ($installed.ExitCode -ne 0) { throw "Installer exited with code $($installed.ExitCode)" }
+          foreach ($file in @('Icom S-meter Plotter.exe', 'docs/Beacon-Plotter-Quick-Start.pdf', 'docs/Beacon-Plotter-Operating-Guide.pdf')) {
+            if (-not (Test-Path (Join-Path $smoke $file))) { throw "Missing installed file $file" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beacon-plotter-windows-installer
+          path: installer-output/VK3FS-Beacon-Strength-Plotter-Setup.exe
+          if-no-files-found: error
