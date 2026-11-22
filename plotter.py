@@ -8,6 +8,7 @@ from io import BytesIO
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
@@ -1524,6 +1525,14 @@ class Plotter(tk.Tk):
         ttk.Button(readouts, text='Synoptic', command=self.open_synoptic_chart).pack(side='left', padx=(8, 0))
         ttk.Button(readouts, text='Hepburn Chart', command=self.open_hepburn_chart).pack(
             side='left', padx=(8, 0))
+        help_button = ttk.Menubutton(readouts, text='Help')
+        help_button.pack(side='left', padx=(8, 0))
+        help_menu = tk.Menu(help_button, tearoff=False)
+        help_menu.add_command(label='Quick Start',
+                              command=lambda: self.open_guide('Beacon-Plotter-Quick-Start.pdf'))
+        help_menu.add_command(label='Operating Guide',
+                              command=lambda: self.open_guide('Beacon-Plotter-Operating-Guide.pdf'))
+        help_button.configure(menu=help_menu)
         self.mute_button = ttk.Button(readouts, text='Mute radio', state='disabled',
                                       command=self.toggle_radio_mute)
         self.mute_button.pack(side='right', padx=(8, 0))
@@ -1605,6 +1614,20 @@ class Plotter(tk.Tk):
         padding = int(toolbar.grid_info()['padx'])
         width = max(MIN_WINDOW_WIDTH, toolbar.winfo_reqwidth() + 2 * padding)
         self.minsize(width, MIN_WINDOW_HEIGHT)
+
+    def open_guide(self, filename):
+        app_file = sys.executable if getattr(sys, 'frozen', False) else __file__
+        path = Path(app_file).resolve().parent / 'docs' / filename
+        if not path.is_file():
+            messagebox.showwarning('Help', 'This guide is missing from the app’s docs folder.', parent=self)
+            return
+        try:
+            if os.name == 'nt':
+                os.startfile(str(path))
+            elif not webbrowser.open(path.as_uri()):
+                raise OSError('No PDF viewer could be opened.')
+        except OSError as exc:
+            messagebox.showwarning('Help', f'Could not open the guide.\n\n{exc}', parent=self)
 
     def apply_display_theme(self):
         theme = effective_theme(self.display_mode_preview or self.display_theme.get(), datetime.now().hour)
