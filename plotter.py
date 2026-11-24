@@ -4,8 +4,10 @@ import csv
 import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from io import BytesIO
 import json
+from math import ceil
 import os
 import re
 import sys
@@ -15,8 +17,8 @@ from threading import Event, Thread
 import time
 import tkinter as tk
 from tkinter import filedialog, font, messagebox, simpledialog, ttk
-from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.parse import urljoin, urlsplit
+from urllib.request import Request, urlopen
 import webbrowser
 
 from beacon_map import MAP_ORIGIN, MY_MAPS_URL, BeaconMapServer, map_page, write_path_kml
@@ -37,11 +39,14 @@ RADIO_ADDRESSES = {
 }
 DEFAULT_RADIO = 'IC-9700'
 DEFAULT_SYNOPTIC_CHART = 'https://reg.bom.gov.au/fwo/IDY00030.202611211800.png'
+BOM_SYNOPTIC_PAGE = 'https://reg.bom.gov.au/australia/charts/synoptic_col.shtml'
 GOOGLE_CLOUD_CONSOLE_URL = 'https://console.cloud.google.com/'
 HEPBURN_CHART_INDEX = 'https://www.dxinfocentre.com/tropo.html'
 ADD_BEACON = 'Add New Beacon'
 DEFAULT_BEACONS = ({'callsign': 'VK5RSE', 'location': 'Mount Gambier', 'hz': 145_550_000},)
 SAMPLE_INTERVALS = (0.5, *range(1, 11))
+AUTO_CONNECT_INTERVAL = 5
+AUTO_CONNECT_WINDOW = 60
 TIME_WINDOWS = (
     (300, '5 min', 5), (600, '10 min', 5), (900, '15 min', 5), (1800, '30 min', 5),
     (3600, '1 hr', 10), (7200, '2 hr', 15), (14400, '4 hr', 30), (28800, '8 hr', 60),
@@ -59,6 +64,40 @@ def validate_chart_url(source):
     parsed = urlsplit(source)
     if parsed.scheme not in ('http', 'https') or not parsed.hostname:
         raise ValueError('Enter a complete HTTP or HTTPS URL.')
+
+
+class BoMChartParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.image_url = ''
+
+    def handle_starttag(self, tag, attributes):
+        if tag != 'img' or self.image_url:
+            return
+        source = dict(attributes).get('src')
+        if source:
+            url = urljoin(BOM_SYNOPTIC_PAGE, source)
+            parsed = urlsplit(url)
+            if parsed.scheme == 'https' and parsed.netloc == 'reg.bom.gov.au' and re.fullmatch(
+                r'/fwo/IDY00030\.[0-9]{12}\.png', parsed.path,
+            ):
+                self.image_url = url
+
+
+def latest_bom_chart_url():
+    # The displayed image is the current analysis. The page also has an archive in its script.
+    request = Request(BOM_SYNOPTIC_PAGE, headers={'Cache-Control': 'no-cache'})
+    max_bytes = 2 * 1024 * 1024
+    with urlopen(request, timeout=12) as response:
+        data = response.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError('The BoM chart page is too large.')
+    parser = BoMChartParser()
+    parser.feed(data.decode('utf-8', errors='replace'))
+    parser.close()
+    if not parser.image_url:
+        raise ValueError('No current synoptic chart was found on the BoM page.')
+    return parser.image_url
 
 
 def read_synoptic_chart(source, size):
@@ -365,6 +404,10 @@ class SetupDialog(simpledialog.Dialog):
         self.callsign = tk.StringVar(parent, value=parent.station_callsign)
         self.locator = tk.StringVar(parent, value=parent.station_locator)
         self.synoptic_source = tk.StringVar(parent, value=parent.synoptic_source)
+        self.synoptic_auto_bom = tk.BooleanVar(parent, value=parent.synoptic_auto_bom)
+        self.manual_synoptic_source = parent.synoptic_source
+        self.bom_chart_url = parent.bom_chart_url
+        self.bom_fetch_job = None
         self.hepburn_source = tk.StringVar(parent, value=parent.hepburn_source)
         self.country_label = tk.StringVar(parent)
         self.update_check_job = None
@@ -435,14 +478,25 @@ class SetupDialog(simpledialog.Dialog):
         ttk.Checkbutton(frame, text='Warn on close', variable=self.warn).pack(anchor='w', padx=10)
         options = ttk.Frame(frame)
         options.pack(fill='x', padx=10, pady=(4, 8))
-        ttk.Checkbutton(options, text='Auto-connect to radio', variable=self.auto_connect).pack(side='left')
+        ttk.Checkbutton(options, text='Radio auto-connect', variable=self.auto_connect).pack(side='left')
         self.update_button = ttk.Button(options, text='Check for updates…', command=self.check_for_updates)
         self.update_button.pack(side='right')
-        synoptic = ttk.LabelFrame(frame, text='Synoptic chart', padding=8)
+        synoptic = ttk.LabelFrame(frame, padding=8)
         synoptic.pack(fill='x', padx=10, pady=(0, 8))
-        ttk.Label(synoptic, text='Image URL').pack(anchor='w', pady=(0, 4))
+        synoptic_title = ttk.Frame(synoptic)
+        ttk.Label(synoptic_title, text='Synoptic chart').pack(side='left')
+        ttk.Checkbutton(synoptic_title, text='Auto fetch BoM', variable=self.synoptic_auto_bom,
+                        command=self.change_synoptic_source).pack(side='left', padx=(12, 0))
+        synoptic.configure(labelwidget=synoptic_title)
+        synoptic_details = ttk.Frame(synoptic)
+        synoptic_details.pack(fill='x', pady=(0, 4))
+        ttk.Label(synoptic_details, text='Image URL').pack(side='left')
+        self.bom_status = ttk.Label(synoptic_details)
+        self.bom_status.pack(side='right')
         self.synoptic_entry = ttk.Entry(synoptic, textvariable=self.synoptic_source, width=34)
         self.synoptic_entry.pack(fill='x')
+        if self.synoptic_auto_bom.get():
+            self.change_synoptic_source()
 
         hepburn = ttk.LabelFrame(frame, text='Hepburn Chart', padding=8)
         hepburn.pack(fill='x', padx=10, pady=(0, 8))
@@ -515,6 +569,43 @@ class SetupDialog(simpledialog.Dialog):
         webbrowser.open(HEPBURN_CHART_INDEX)
         return 'break'
 
+    def change_synoptic_source(self):
+        if self.bom_fetch_job is not None:
+            self.after_cancel(self.bom_fetch_job)
+            self.bom_fetch_job = None
+        if not self.synoptic_auto_bom.get():
+            self.synoptic_entry.state(['!readonly'])
+            self.synoptic_source.set(self.manual_synoptic_source)
+            self.bom_status.configure(text='')
+            return
+
+        self.manual_synoptic_source = self.synoptic_source.get()
+        self.synoptic_entry.state(['readonly'])
+        self.synoptic_source.set(self.bom_chart_url)
+        self.bom_status.configure(text='Fetching BoM chart…')
+        result = Queue(maxsize=1)
+
+        def fetch():
+            try:
+                result.put(latest_bom_chart_url())
+            except (OSError, ValueError):
+                result.put('')
+
+        def show_result():
+            self.bom_fetch_job = None
+            try:
+                url = result.get_nowait()
+            except Empty:
+                self.bom_fetch_job = self.after(100, show_result)
+                return
+            if url:
+                self.bom_chart_url = url
+                self.synoptic_source.set(url)
+            self.bom_status.configure(text='' if url else 'Could not refresh BoM link')
+
+        Thread(target=fetch, daemon=True).start()
+        self.bom_fetch_job = self.after(100, show_result)
+
     def check_for_updates(self):
         result = Queue(maxsize=1)
 
@@ -581,12 +672,13 @@ class SetupDialog(simpledialog.Dialog):
             messagebox.showwarning('Maidenhead locator', str(exc), parent=self)
             self.locator_entry.focus_set()
             return False
-        for title, variable, entry in (
-            ('Synoptic chart', self.synoptic_source, self.synoptic_entry),
-            ('Hepburn Chart', self.hepburn_source, self.hepburn_entry),
+        for title, source, entry in (
+            ('Synoptic chart', '' if self.synoptic_auto_bom.get() else self.synoptic_source.get(),
+             self.synoptic_entry),
+            ('Hepburn Chart', self.hepburn_source.get(), self.hepburn_entry),
         ):
             try:
-                if source := variable.get().strip():
+                if source := source.strip():
                     validate_chart_url(source)
             except ValueError as exc:
                 messagebox.showwarning(title, str(exc), parent=self)
@@ -595,16 +687,20 @@ class SetupDialog(simpledialog.Dialog):
         return True
 
     def apply(self):
+        auto_bom = self.synoptic_auto_bom.get()
+        manual_source = self.manual_synoptic_source if auto_bom else self.synoptic_source.get()
         self.result = (self.percent.get(), self.warn.get(), self.auto_connect.get(),
                        self.axis_units.get(), self.dbm_reference.get(), self.display_mode.get(), self.smoothing.get(),
                        self.callsign.get().strip().upper(), self.locator.get().strip().upper(),
                        self.station_coordinates, float(self.sample_interval.get().split()[0]),
-                       self.synoptic_source.get().strip(), self.hepburn_source.get().strip())
+                       manual_source.strip(), auto_bom, self.bom_chart_url, self.hepburn_source.get().strip())
 
     def destroy(self):
         self.locator.trace_remove('write', self.locator_trace)
         if self.update_check_job is not None:
             self.after_cancel(self.update_check_job)
+        if self.bom_fetch_job is not None:
+            self.after_cancel(self.bom_fetch_job)
         super().destroy()
 
 
@@ -715,6 +811,48 @@ def format_radio_frequency(hz):
     return f'{mhz}.{khz:03d}.{hz_remainder // 10:02d}'
 
 
+def windows_com_device_names():
+    # Some virtual ports have a DOS device name but are omitted by pyserial's device scan.
+    query = ctypes.WinDLL('kernel32', use_last_error=True).QueryDosDeviceW
+    query.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    query.restype = wintypes.DWORD
+    buffer_size = 4096
+    while True:
+        buffer = ctypes.create_unicode_buffer(buffer_size)
+        count = query(None, buffer, buffer_size)
+        if count:
+            return {name.upper() for name in buffer[:count].split('\0')
+                    if re.fullmatch(r'COM[0-9]+', name, re.IGNORECASE)}
+        error = ctypes.get_last_error()
+        if error != 122:  # ERROR_INSUFFICIENT_BUFFER
+            raise ctypes.WinError(error)
+        buffer_size *= 2
+
+
+def available_serial_ports():
+    from serial.tools.list_ports import comports
+
+    if os.name != 'nt':
+        return sorted({port.device for port in comports()})
+
+    try:
+        ports = {port.device.upper() for port in comports()}
+    except OSError:
+        ports = None
+    try:
+        windows_ports = windows_com_device_names()
+    except OSError:
+        if ports is None:
+            raise
+        windows_ports = set()
+
+    def sort_key(name):
+        number = name[3:] if name.startswith('COM') else ''
+        return (int(number) if number.isdecimal() else float('inf'), name)
+
+    return sorted((ports or set()) | windows_ports, key=sort_key)
+
+
 def beacon_label(beacon):
     return f"{beacon['callsign']}  ·  {beacon['location']}  ·  {beacon['hz'] / 1e6:.6f} MHz"
 
@@ -818,8 +956,7 @@ class VKSpotterDialog(simpledialog.Dialog):
         buttons = ttk.Frame(self, padding=(15, 6, 15, 12))
         buttons.pack(fill='x')
         ttk.Button(buttons, text='Close', command=self.cancel).pack(side='right')
-        action = 'Use Selected' if self.lookup else 'Import Selected Beacon'
-        self.use_record = ttk.Button(buttons, text=action, command=self.ok)
+        self.use_record = ttk.Button(buttons, text='Use Selected', command=self.ok, state='disabled')
         self.use_record.pack(side='right', padx=6)
         self.use_all = ttk.Button(buttons, text='Add All', command=self.add_all_shown, state='disabled')
         self.use_all.pack(side='right')
@@ -828,6 +965,7 @@ class VKSpotterDialog(simpledialog.Dialog):
         self.forget.pack(side='left')
         self.bind('<Escape>', self.cancel)
         self.table.bind('<Return>', self.ok)
+        self.table.bind('<<TreeviewSelect>>', self.update_import_controls)
         self.password.bind('<Return>', lambda _event: self.start_fetch())
         if self.lookup and self.saved_login:
             self.poll_job = self.after_idle(self.start_fetch)
@@ -867,6 +1005,15 @@ class VKSpotterDialog(simpledialog.Dialog):
                                   if self.records[int(item)]['hz'] is not None])
         self.ok()
 
+    def update_import_controls(self, _event=None):
+        selected = [self.records[int(item)] for item in self.table.selection()]
+        can_import = bool(selected) and (all(row['hz'] is not None for row in selected)
+                                         or (self.lookup and len(selected) == 1))
+        ready = self.poll_job is None
+        self.use_record.state(('!disabled',) if ready and can_import else ('disabled',))
+        usable = sum(self.records[int(item)]['hz'] is not None for item in self.table.get_children())
+        self.use_all.state(('!disabled',) if ready and usable > 1 else ('disabled',))
+
     def start_fetch(self):
         if self.fetch.instate(('disabled',)):
             return
@@ -905,7 +1052,7 @@ class VKSpotterDialog(simpledialog.Dialog):
                 return
             self.fetch.state(('!disabled',))
             self.paste.state(('!disabled',))
-            self.use_record.state(('!disabled',))
+            self.update_import_controls()
             self.show_sign_in('in' if fetched.signed_in else 'out')
             self.lock_credentials(fetched.signed_in)
             self.verified_login = (username, password) if fetched.signed_in else None
@@ -976,12 +1123,12 @@ class VKSpotterDialog(simpledialog.Dialog):
                 self.table.insert('', 'end', iid=str(index), values=values, tags=(band,) if band else ())
         shown = self.table.get_children()
         usable = sum(self.records[int(item)]['hz'] is not None for item in shown)
-        self.use_all.state(('!disabled',) if usable > 1 and self.poll_job is None else ('disabled',))
+        self.update_import_controls()
         if self.records:
             count = len(shown)
             detail = ' Ctrl+click or Shift+click to select multiple frequencies.' if usable > 1 else ''
-            if count > usable and usable > 1:
-                detail += ' Add All uses displayed rows with a readable frequency.'
+            if usable > 1:
+                detail += ' Add All imports only shown rows with a readable frequency.'
             self.note.set(f'{count} of {len(self.records)} beacon records shown.{detail}' if count
                           else 'No matches in this list. Check the callsign or try a fresh VKSpotter list.')
 
@@ -1231,6 +1378,7 @@ def set_radio_mute(port, address, pending, previous_volume):
 def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, sample_interval):
     import serial
 
+    port_failed = False
     try:
         with serial.Serial(port_name, baud, timeout=0.1, write_timeout=0.5) as port:
             pending = bytearray()
@@ -1290,10 +1438,13 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     events.put(('frequency', frequency))
                     next_frequency = started + 1.0
                 stop.wait(min(0.1, max(0, last_sample + sample_interval() - time.monotonic())))
-    except (OSError, ValueError, OverflowError, serial.SerialException) as exc:
+    except (OSError, serial.SerialException) as exc:
+        port_failed = True
+        events.put(('error', str(exc)))
+    except (ValueError, OverflowError) as exc:
         events.put(('error', str(exc)))
     finally:
-        events.put(('closed', None))
+        events.put(('closed', port_failed))
 
 
 def copy_window_image(widget_id):
@@ -1359,7 +1510,6 @@ def copy_window_image(widget_id):
 class Plotter(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f'VK3FS Beacon Strength Plotter v{APP_VERSION}')
         if os.name == 'nt':
             icon_path = Path(__file__).resolve().with_name('radio_tower.ico')
             try:
@@ -1377,6 +1527,7 @@ class Plotter(tk.Tk):
         self.view_end = None
         self.stop = None
         self.radio_responding = False
+        self.radio_verified = False
         self.pause = Event()
         self.pause_time = None
         self.settings_path = settings_file()
@@ -1396,6 +1547,7 @@ class Plotter(tk.Tk):
         self.restore_volume = None
         self.audio_pending = False
         self.auto_connecting = False
+        self.auto_connect_job = None
         self.current_hz = None
         self.baud = tk.StringVar(value=settings.get('baud', '115200'))
         model, address = radio_setup(settings)
@@ -1421,12 +1573,15 @@ class Plotter(tk.Tk):
         callsign = settings.get('station_callsign')
         locator = settings.get('station_locator')
         self.station_callsign = callsign.strip().upper() if isinstance(callsign, str) else ''
+        self.title(f'{self.plotter_heading} v{APP_VERSION}')
         self.station_locator = locator.strip().upper() if isinstance(locator, str) else ''
         self.station_coordinates = None
         key = settings.get('google_maps_key')
         self.google_maps_key = key if isinstance(key, str) else ''
         self.map_server = None
         self.synoptic_window = None
+        self.synoptic_auto_bom = settings.get('synoptic_auto_bom') is True
+        self.bom_chart_url = ''
         source = settings.get('synoptic_source', DEFAULT_SYNOPTIC_CHART)
         self.synoptic_source = source.strip() if isinstance(source, str) else DEFAULT_SYNOPTIC_CHART
         if self.synoptic_source:
@@ -1484,6 +1639,7 @@ class Plotter(tk.Tk):
             field.grid(row=1, column=column, padx=(0, 12), sticky='ew')
             self.inputs.append(field)
             radio_labels.append((label, field))
+        self.inputs[0].configure(postcommand=self.refresh_ports)
         self.refresh = ttk.Button(radio_panel, text='Refresh ports', command=self.refresh_ports)
         self.refresh.grid(row=2, column=0, sticky='w', padx=(10, 0), pady=(5, 8))
         self.connect = ttk.Button(radio_panel, text='Connect', command=self.toggle_connection)
@@ -1589,14 +1745,23 @@ class Plotter(tk.Tk):
         if first_run:
             self.after_idle(self.prompt_first_run_station)
         elif self.auto_connect and self.last_connected_radio:
-            self.after_idle(self.reconnect_last_radio)
+            self.after_idle(self.start_radio_auto_connect)
 
     def prompt_first_run_station(self):
         result = FirstRunStationDialog(self, 'Your station').result
         if result:
             self.station_callsign, self.station_locator, self.station_coordinates = result
+            self.update_station_title()
             self.sync_beacon()
         self.persist_settings()
+
+    @property
+    def plotter_heading(self):
+        return f'{self.station_callsign} {PLOTTER_HEADING}' if self.station_callsign else PLOTTER_HEADING
+
+    def update_station_title(self):
+        self.title(f'{self.plotter_heading} v{APP_VERSION}')
+        self.update_backdrop()
 
     def open_hepburn_chart(self):
         if self.hepburn_source:
@@ -1776,8 +1941,9 @@ class Plotter(tk.Tk):
     def open_synoptic_chart(self):
         from PIL import Image, ImageTk
 
-        source = self.synoptic_source
-        if not source:
+        auto_bom = self.synoptic_auto_bom
+        source = self.bom_chart_url if auto_bom else self.synoptic_source
+        if not auto_bom and not source:
             messagebox.showinfo('Synoptic', 'Set an image URL in Setup → Synoptic chart.', parent=self)
             return
         if self.synoptic_window is not None and self.synoptic_window.winfo_exists():
@@ -1796,22 +1962,35 @@ class Plotter(tk.Tk):
         result = Queue(maxsize=1)
 
         def fetch():
+            url = source
+            stale = False
+            if auto_bom:
+                try:
+                    url = latest_bom_chart_url()
+                except (OSError, ValueError):
+                    stale = True
             try:
-                result.put(read_synoptic_chart(source, screen_size))
+                image = read_synoptic_chart(url, screen_size) if url else None
             except (OSError, ValueError, Image.DecompressionBombError):
-                result.put(None)
+                image = None
+            result.put((url, image, stale))
 
         def show():
             if not window.winfo_exists():
                 return
             try:
-                image = result.get_nowait()
+                url, image, stale = result.get_nowait()
             except Empty:
                 self.after(100, show)
                 return
             if image is None:
-                chart.configure(text='Could not load the chart. Check the image URL in Setup.')
+                chart.configure(text='Could not load the latest BoM chart. Try again shortly.' if auto_bom else
+                                'Could not load the chart. Check the image URL in Setup.')
             else:
+                if auto_bom:
+                    self.bom_chart_url = url
+                if stale:
+                    window.title('Synoptic — last fetched BoM chart')
                 chart.image = ImageTk.PhotoImage(image, master=window)
                 chart.configure(image=chart.image, text='')
 
@@ -2043,10 +2222,8 @@ class Plotter(tk.Tk):
         self.draw()
 
     def refresh_ports(self):
-        from serial.tools.list_ports import comports
-
         try:
-            ports = sorted(port.device for port in comports())
+            ports = available_serial_ports()
         except OSError as exc:
             self.status.set(f'Could not list COM ports: {exc}')
             return
@@ -2054,17 +2231,47 @@ class Plotter(tk.Tk):
         if not self.port.get() and len(ports) == 1:
             self.port.set(ports[0])
 
-    def reconnect_last_radio(self):
+    def start_radio_auto_connect(self, *, preserve_history=False):
         if not self.auto_connect or self.stop is not None:
             return
         saved = self.last_connected_radio
+        if not saved:
+            return
         self.model.set(saved['model'])
         self.port.set(saved['port'])
         self.baud.set(saved['baud'])
         self.address.set(saved['address'])
-        self.toggle_connection(automatic=True)
+        self.retry_radio_auto_connect(time.monotonic() + AUTO_CONNECT_WINDOW, preserve_history)
 
-    def toggle_connection(self, automatic=False):
+    def retry_radio_auto_connect(self, deadline, preserve_history):
+        self.auto_connect_job = None
+        if not self.auto_connect:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if self.auto_connecting and self.stop is not None:
+                self.stop.set()
+            self.status.set(f'Auto-connect timed out on {self.port.get()}. Click Connect to try again.')
+            return
+        saved = self.last_connected_radio
+        if (self.model.get(), self.port.get(), self.baud.get(), self.address.get()) != (
+            saved['model'], saved['port'], str(saved['baud']), saved['address'],
+        ):
+            self.status.set('Radio settings changed. Click Connect to use the new settings.')
+            return
+        delay = min(AUTO_CONNECT_INTERVAL * 1000, ceil(remaining * 1000))
+        self.auto_connect_job = self.after(delay, self.retry_radio_auto_connect, deadline, preserve_history)
+        if self.stop is None:
+            self.toggle_connection(automatic=True, preserve_history=preserve_history)
+
+    def cancel_radio_auto_connect(self):
+        if self.auto_connect_job is not None:
+            self.after_cancel(self.auto_connect_job)
+            self.auto_connect_job = None
+
+    def toggle_connection(self, automatic=False, *, preserve_history=False):
+        if not automatic:
+            self.cancel_radio_auto_connect()
         if self.stop is not None:
             self.stop.set()
             self.set_radio_responding(False)
@@ -2086,14 +2293,16 @@ class Plotter(tk.Tk):
             'Start live plot', 'Connecting will replace the displayed plot. Continue?', parent=self,
         ):
             return
-        self.history.clear()
+        if not preserve_history:
+            self.history.clear()
+            self.time_offset = time.time() - time.monotonic()
+            self.view_end = None
         self.loaded_plot = False
-        self.time_offset = time.time() - time.monotonic()
-        self.view_end = None
         self.plot_model = self.model.get()
         self.draw()
         self.readout.set('Raw CI-V  —')
         self.stop = Event()
+        self.radio_verified = False
         self.auto_connecting = automatic
         self.radio_requests = Queue(maxsize=2)
         self.connect.configure(text='Disconnect')
@@ -2129,21 +2338,25 @@ class Plotter(tk.Tk):
             while True:
                 kind, payload = self.events.get_nowait()
                 if kind == 'sample':
+                    value = payload[1]
+                    if self.stop.is_set():
+                        continue
+                    if self.auto_connecting:
+                        if value is None:
+                            self.stop.set()
+                            continue
+                        self.auto_connecting = False
+                        self.cancel_radio_auto_connect()
+                        self.pause_button.configure(state='normal')
+                    if value is not None:
+                        self.radio_verified = True
                     if payload[0] >= self.plot_cleared_at:
                         self.history.append(payload)
-                    value = payload[1]
                     self.set_radio_responding(value is not None and self.stop is not None and not self.stop.is_set())
                     self.readout.set(f"Raw CI-V  {'—' if value is None else value}")
                     if not self.tuning and not self.pause.is_set():
                         self.status.set('No meter reply. Check the radio’s COM port, baud and address.'
                                         if value is None else f'Receiving meter readings every {self.sample_interval:g} s.')
-                    if self.auto_connecting:
-                        self.auto_connecting = False
-                        if value is None:
-                            self.toggle_connection()
-                            self.status.set(f'No radio reply on {self.port.get()}. Check the radio, then click Connect.')
-                            continue
-                        self.pause_button.configure(state='normal')
                     if value is not None and not self.audio_pending and not self.stop.is_set():
                         self.mute_button.configure(state='normal')
                     self.remember_port(value)
@@ -2172,13 +2385,18 @@ class Plotter(tk.Tk):
                     else:
                         messagebox.showwarning('Radio volume', payload, parent=self)
                 elif kind == 'error':
+                    if self.stop.is_set():
+                        continue
                     self.set_radio_responding(False)
                     self.status.set(f"Could not auto-connect on {self.port.get()}. {payload}"
                                     if self.auto_connecting else payload)
                     self.readout.set('Raw CI-V  —')
                 elif kind == 'closed':
+                    recover = payload and self.auto_connect and self.radio_verified and not self.stop.is_set()
                     self.set_radio_responding(False)
-                    if self.status.get() == 'Disconnecting…':
+                    if self.auto_connecting and self.auto_connect_job is not None:
+                        self.status.set(f'Waiting for the radio on {self.port.get()}. Retrying automatically…')
+                    elif self.status.get() == 'Disconnecting…':
                         self.status.set('Disconnected.')
                     self.stop = None
                     self.restore_volume = None
@@ -2197,6 +2415,10 @@ class Plotter(tk.Tk):
                     self.radio_picker.configure(state='readonly')
                     for widget in (*self.inputs, self.refresh):
                         widget.configure(state='normal')
+                    if recover:
+                        if self.history:
+                            self.history.append((time.monotonic(), None))
+                        self.start_radio_auto_connect(preserve_history=True)
         except Empty:
             pass
         if self.history and self.last_draw != self.history[-1]:
@@ -2249,6 +2471,7 @@ class Plotter(tk.Tk):
         if self.stop is not None:
             messagebox.showinfo('Open saved plot', 'Disconnect the radio before opening a saved plot.', parent=self)
             return
+        self.cancel_radio_auto_connect()
         path = filedialog.askopenfilename(parent=self, filetypes=[('Beacon plot', '*.bplot')])
         if not path:
             return
@@ -2290,11 +2513,23 @@ class Plotter(tk.Tk):
             self.display_mode_preview = None
             self.setup_dialog = None
         if result is not None:
+            previous_callsign = self.station_callsign
             (self.plot_transparency, self.warn_on_close, self.auto_connect,
              units, reference, mode, smoothing, self.station_callsign, self.station_locator,
-             self.station_coordinates, self.sample_interval, synoptic_source, self.hepburn_source) = result
-            if synoptic_source != self.synoptic_source:
+             self.station_coordinates, self.sample_interval, synoptic_source, synoptic_auto_bom,
+             bom_chart_url, self.hepburn_source) = result
+            if not self.auto_connect and self.auto_connect_job is not None:
+                self.cancel_radio_auto_connect()
+                if self.auto_connecting and self.stop is not None:
+                    self.toggle_connection()
+                else:
+                    self.status.set('Radio auto-connect is off. Click Connect to start manually.')
+            if (synoptic_source, synoptic_auto_bom, bom_chart_url) != (
+                self.synoptic_source, self.synoptic_auto_bom, self.bom_chart_url,
+            ):
                 self.synoptic_source = synoptic_source
+                self.synoptic_auto_bom = synoptic_auto_bom
+                self.bom_chart_url = bom_chart_url
                 if self.synoptic_window is not None and self.synoptic_window.winfo_exists():
                     self.synoptic_window.destroy()
             self.axis_units.set(units)
@@ -2304,6 +2539,8 @@ class Plotter(tk.Tk):
             self.sync_beacon()
             self.persist_settings()
         self.apply_display_theme()
+        if result is not None and self.station_callsign != previous_callsign:
+            self.update_station_title()
         self.render_plot_wallpaper()
         self.draw()
 
@@ -2346,7 +2583,8 @@ class Plotter(tk.Tk):
         panels = (*self.setup_panels, (self.chart, self.chart, None, ()))
         bounds = [(container.winfo_x(), container.winfo_y(), container.winfo_width(), container.winfo_height())
                   for container, _, _, _ in panels]
-        key = (theme, width, height, bounds)
+        heading = self.plotter_heading
+        key = (theme, width, height, bounds, heading)
         if key == self.backdrop_key or min(width, height) < 2:
             return
         self.backdrop_key = key
@@ -2354,6 +2592,8 @@ class Plotter(tk.Tk):
         heading_drawn = False
         scene = None
         heading_colour = '#103047' if theme == 'Day' else '#f1f7ff'
+        # Leave room for the right-aligned local and UTC clocks.
+        heading_width = max(1, width - 180)
         try:
             from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
@@ -2362,13 +2602,16 @@ class Plotter(tk.Tk):
                 scene = ImageOps.fit(source.convert('RGB'), (width, height), Image.Resampling.LANCZOS)
             try:
                 font_file = asset.with_name('OpenSans-Bold.ttf')
-                font = ImageFont.truetype(str(font_file), size=44)
+                heading_font = ImageFont.truetype(str(font_file), size=44)
+                measured_width = heading_font.getlength(heading)
+                if measured_width > heading_width:
+                    heading_font = heading_font.font_variant(size=max(1, int(44 * heading_width / measured_width)))
             except OSError:
                 pass
             else:
                 draw = ImageDraw.Draw(scene)
-                _, top, _, bottom = draw.textbbox((0, 0), PLOTTER_HEADING, font=font)
-                draw.text((24, 45 - (top + bottom) / 2), PLOTTER_HEADING, font=font,
+                _, top, _, bottom = draw.textbbox((0, 0), heading, font=heading_font)
+                draw.text((24, 45 - (top + bottom) / 2), heading, font=heading_font,
                           fill=heading_colour)
                 heading_drawn = True
             self.backdrop_photo = ImageTk.PhotoImage(scene, master=self)
@@ -2380,8 +2623,13 @@ class Plotter(tk.Tk):
         if self.backdrop_photo is not None:
             self.backdrop.create_image(0, 0, image=self.backdrop_photo, anchor='nw')
         if not heading_drawn:
-            self.backdrop.create_text(24, 45, text=PLOTTER_HEADING, anchor='w',
-                                      font=('Segoe UI', 25, 'bold'), fill=heading_colour)
+            heading_font = font.Font(root=self, family='Segoe UI', size=25, weight='bold')
+            measured_width = heading_font.measure(heading)
+            if measured_width > heading_width:
+                heading_font.configure(size=max(1, int(25 * heading_width / measured_width)))
+            self.backdrop.create_text(24, 45, text=heading, anchor='w',
+                                      font=heading_font, fill=heading_colour)
+            self.backdrop.heading_font = heading_font
 
         self.plot_wallpaper_layers = None
         for (_, panel, title, labels), (x, y, panel_width, panel_height) in zip(panels, bounds):
@@ -2564,6 +2812,7 @@ class Plotter(tk.Tk):
                 'station_locator': self.station_locator,
                 'google_maps_key': self.google_maps_key,
                 'synoptic_source': self.synoptic_source,
+                'synoptic_auto_bom': self.synoptic_auto_bom,
                 'hepburn_source': self.hepburn_source,
             })
         except OSError as exc:
@@ -2577,6 +2826,7 @@ class Plotter(tk.Tk):
             return
         if self.stop is not None:
             self.stop.set()
+        self.cancel_radio_auto_connect()
         if self.map_server is not None:
             self.map_server.close()
         self.persist_settings()

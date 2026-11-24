@@ -3,9 +3,18 @@ VK3FS Signal Strength plotter for radio beacons
 Select your radio and CI-V COM port in the Radio connection panel. Selecting a named model
 fills its default CI-V address. The address and baud rate are editable.
 Match the baud rate configured on the radio, then click Connect.
-The first launch requires a manual connection. When Auto-connect to radio is enabled, later launches try the last
-working radio, COM port, baud rate and CI-V address once. If the radio is
-unavailable, check the status line and click Connect to try again.
+The COM port list refreshes when you open the dropdown or click Refresh ports.
+On Windows it includes virtual ports exposed as COM names, such as COM21.
+Use the client end of a virtual pair when connecting through a CAT sharing
+server. You can also type a COM port name into the field.
+The first launch requires a manual connection. With Radio auto-connect
+enabled in Setup, later launches try the last working radio immediately and
+retry every five seconds for up to one minute. A valid S-meter reply stops
+the retries. If the radio is still unavailable, click Connect to try again.
+An unexpected COM port failure after a verified connection starts a new
+retry window. Retained readings stay on the plot, with a gap during the
+outage. After reconnection, live sampling resumes. Click Disconnect
+during an attempt to stop the retry sequence.
 
 Presets: IC-905 (AC), IC-9700 (A2), IC-705 (A4), IC-7300 (94),
 IC-7300MK2 (B6), IC-7610 (98), IC-7760 (B2), and Custom Icom.
@@ -92,6 +101,7 @@ OK saves your choice and Cancel restores the previous display setting. Auto uses
 time, switching to Day at 07:00 and Night at 18:00. The app saves your choice. The app background shows a sunny forest in Day mode and a moonlit
 version in Night mode. The graph defaults to 35% transparency.
 
+The main heading and window title start with your callsign when set in Setup.
 The top-right clocks show local time and UTC in 24-hour format.
 
 
@@ -103,8 +113,8 @@ that fits the measurements you are viewing. It applies to the whole trace.
 Open Setup to adjust plot transparency from solid (0%) to clear (100%).
 The chart previews the slider as you drag. OK saves the changes and Cancel
 restores the previous appearance. The grid, labels and trace stay opaque.
-Warn on close and Auto-connect to radio are enabled by default. Auto-connect
-uses the last verified radio and requires a previous successful connection.
+Warn on close and Radio auto-connect are enabled by default. Auto-connect
+uses the last verified radio, COM port, baud rate and CI-V address.
 
 Use Setup to choose the smoothing level, including 50, 75 and 100 samples.
 The moving average applies to the displayed trace and restarts after gaps.
@@ -121,7 +131,7 @@ Choose Forget Saved Login to remove the login and enter different details.
 If the page cannot be read directly, choose Open VKSpotter, sign in in your
 browser, use Copy above the Beacons table, then choose Paste Beacon List.
 Search by callsign, grid, location, frequency or status. Select a record and
-use Import Selected Beacon to add it to your saved beacons, or to refresh
+use Use Selected to add it to your saved beacons, or to refresh
 the details of an existing callsign and frequency. Importing does not tune
 the radio. The list displays VKSpotter's reported status as retrieved.
 
@@ -158,9 +168,9 @@ Google My Maps and import the saved KML into a map layer.
 Use the Y zoom slider on the right edge of the plot to expand weak signals.
 Move it upwards for more magnification or down to 1 for the full scale.
 
-Click Synoptic to view the chart in a popup. Set its image URL under
-Setup > Synoptic chart. The initial setting is the Bureau
-of Meteorology chart for 21 November 2026 at 18:00 UTC.
+In Setup > Synoptic chart, tick Auto fetch BoM and click OK. The program fills
+in the current chart URL and checks again when you open the Synoptic popup.
+Untick Auto fetch BoM to switch back to your own image URL.
 
 Hepburn Chart appears beside Synoptic. To select your forecast, go to
 Setup > Hepburn Chart, click Choose a chart, then copy the URL for the

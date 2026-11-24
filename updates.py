@@ -5,7 +5,7 @@ import re
 from urllib.request import Request, urlopen
 
 
-APP_VERSION = '1.0.1'
+APP_VERSION = '1.0.7'
 REPOSITORY = 'AM3FS/Beacon-Strength-Plotter'
 RELEASES_URL = f'https://github.com/{REPOSITORY}/releases'
 LATEST_RELEASE_API = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
@@ -13,7 +13,7 @@ INSTALLER_NAME = 'VK3FS-Beacon-Strength-Plotter-Setup.exe'
 
 
 def version_tuple(version):
-    match = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', version)
+    match = re.fullmatch(r'[vV]?(\d+)\.(\d+)\.(\d+)', version)
     if not match:
         raise ValueError('Expected a stable version such as v1.0.0.')
     return tuple(map(int, match.groups()))

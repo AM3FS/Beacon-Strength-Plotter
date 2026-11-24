@@ -7,8 +7,9 @@ Beacon Strength Plotter is a Windows program for monitoring and recording amateu
 - **Save and share** — Save and reopen plots, export timestamped raw CI-V readings as CSV, or copy a screenshot.
 - **Beacon presets and VKSpotter** — Manage colour-coded presets, tune to a saved frequency in CW, and look up or import multiple beacon frequencies from VKSpotter.
 - **Distance, bearing and terrain** — Use Maidenhead locators to calculate distance and true bearing. View the station-to-beacon path and elevation profile in Google Maps, or export the path as KML.
-- **Propagation charts** — Open a configured synoptic chart or your preferred Hepburn tropospheric forecast from the toolbar.
-- **Display, help and updates** — Choose Day, Night or Auto mode, open the Quick Start and Operating Guide from **Help**, and check for new releases in **Setup**.
+- **Propagation charts** — Automatically fetch the latest Bureau of Meteorology synoptic chart, use a custom image URL, or open your preferred Hepburn forecast.
+- **Radio auto-connect** — Discover Windows USB and virtual COM ports and retry after an unexpected connection loss.
+- **Display, help and updates** — Show your callsign in the title, choose Day, Night or Auto mode, open the Quick Start and Operating Guide from **Help**, and check for new releases in **Setup**.
 
 ## Supported Icom radios
 
