@@ -1,4 +1,4 @@
-"""Serve the beacon path locally for Google Maps, or export it as KML."""
+"""Open, serve or export a station-to-beacon path."""
 
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +14,16 @@ MAP_HOST = '127.0.0.1'
 MAP_PORT = 8767
 MAP_ORIGIN = f'http://{MAP_HOST}:{MAP_PORT}'
 MY_MAPS_URL = 'https://www.google.com/mymaps'
+PATH_PROFILE_URL = 'https://profile.ok1cdj.com/'
+
+
+def path_profile_url(origin, destination):
+    query = urlencode({
+        'a': f'{origin[0]:.5f},{origin[1]:.5f}',
+        'b': f'{destination[0]:.5f},{destination[1]:.5f}',
+        'lang': 'en',
+    }, safe=',')
+    return f'{PATH_PROFILE_URL}?{query}'
 
 
 def map_page(api_key, station, beacon, origin, destination, summary, *, elevation=False):

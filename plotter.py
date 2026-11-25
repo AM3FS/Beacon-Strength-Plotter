@@ -21,7 +21,7 @@ from urllib.parse import urljoin, urlsplit
 from urllib.request import Request, urlopen
 import webbrowser
 
-from beacon_map import MAP_ORIGIN, MY_MAPS_URL, BeaconMapServer, map_page, write_path_kml
+from beacon_map import MAP_ORIGIN, MY_MAPS_URL, BeaconMapServer, map_page, path_profile_url, write_path_kml
 from station_location import beacon_path, country_at, maidenhead_coordinates
 from updates import APP_VERSION, check_latest_release
 from vkspotter import BEACONS_URL, clipboard_beacons, fetch_beacons, listed_frequency_hz
@@ -163,6 +163,16 @@ BEACON_BANDS = {
     '6cm': (((5650, 5850),), '#f6dfea', '#4c3549'),
     '3cm': (((10000, 10450),), '#e5edcf', '#3b442a'),
 }
+TRACE_BAND_COLOURS = {
+    '6m': ('#865b00', '#f2c45d'),
+    '2m': ('#194187', '#3bcbef'),
+    '70cm': ('#14643a', '#5bdd8b'),
+    '23cm': ('#7339a9', '#ce9bff'),
+    '13cm': ('#a64c00', '#ff992c'),
+    '9cm': ('#086c68', '#5adbd0'),
+    '6cm': ('#a73569', '#ff91bd'),
+    '3cm': ('#576812', '#bad768'),
+}
 
 
 def beacon_band(hz):
@@ -232,7 +242,9 @@ def dbm_ticks(reference):
 SMOOTHING_WINDOWS = {'Off': 1, 'Light (3 samples)': 3, 'Medium (5 samples)': 5,
                      'Strong (10 samples)': 10, 'Extra strong (20 samples)': 20,
                      '50 samples': 50, '75 samples': 75, '100 samples': 100}
-PLOT_FORMAT = 'vk3fs-beacon-plot-v1'
+LEGACY_PLOT_FORMAT = 'vk3fs-beacon-plot-v1'
+FREQUENCY_PLOT_FORMAT = 'vk3fs-beacon-plot-v2'
+PLOT_FORMAT = 'vk3fs-beacon-plot-v3'
 
 
 def smooth_samples(samples, count):
@@ -241,23 +253,28 @@ def smooth_samples(samples, count):
         return
     recent = deque(maxlen=count)
     total = 0
-    for timestamp, raw in samples:
-        if raw is None:
+    previous_hz = None
+    for timestamp, raw, hz, callsign in samples:
+        if raw is None or hz != previous_hz:
             recent.clear()
             total = 0
-            yield timestamp, None
+        previous_hz = hz
+        if raw is None:
+            yield timestamp, None, hz, callsign
         else:
             if len(recent) == count:
                 total -= recent[0]
             recent.append(raw)
             total += raw
-            yield timestamp, round(total / len(recent))
+            yield timestamp, round(total / len(recent)), hz, callsign
 
 
 def read_plot(path):
     data = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(data, dict) or data.get('format') != PLOT_FORMAT:
+    formats = {LEGACY_PLOT_FORMAT: 2, FREQUENCY_PLOT_FORMAT: 3, PLOT_FORMAT: 4}
+    if not isinstance(data, dict) or not isinstance(data.get('format'), str) or data['format'] not in formats:
         raise ValueError('Choose a plot file saved by Beacon Strength Plotter.')
+    reading_size = formats[data['format']]
     model = data.get('radio_model')
     samples = data.get('samples')
     if not isinstance(model, str) or model not in RADIO_ADDRESSES or not isinstance(samples, list) or not samples:
@@ -265,13 +282,19 @@ def read_plot(path):
     history = deque()
     previous = 0
     for point in samples:
-        if not isinstance(point, list) or len(point) != 2:
+        if not isinstance(point, list) or len(point) != reading_size:
             raise ValueError('The plot file contains an invalid reading.')
-        stamp, raw = point
+        stamp, raw = point[:2]
+        hz = point[2] if reading_size >= 3 else None
+        callsign = point[3] if reading_size == 4 else None
         if (type(stamp) not in (int, float) or not previous <= stamp < 253402214400
                 or (raw is not None and (type(raw) is not int or not 0 <= raw <= 255))):
             raise ValueError('The plot file contains an invalid timestamp or CI-V reading.')
-        history.append((stamp, raw))
+        if hz is not None and (type(hz) is not int or not 0 < hz < 10**12):
+            raise ValueError('The plot file contains an invalid frequency.')
+        if callsign is not None and (not isinstance(callsign, str) or not callsign.isprintable()):
+            raise ValueError('The plot file contains an invalid beacon callsign.')
+        history.append((stamp, raw, hz, callsign))
         previous = stamp
     return model, history
 
@@ -280,7 +303,7 @@ def write_plot_csv(path, samples):
     with path.open('w', newline='', encoding='utf-8') as stream:
         writer = csv.writer(stream)
         writer.writerow(('timestamp_utc', 'raw_ci_v'))
-        for timestamp, raw in samples:
+        for timestamp, raw, _, _callsign in samples:
             writer.writerow((datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec='milliseconds'), raw))
 
 
@@ -1336,7 +1359,7 @@ def read_frequency(port, address, pending):
     if data is None or len(data) not in (5, 6):
         return None
     digits = data[::-1].hex()
-    return int(digits) if digits.isdecimal() else None
+    return (int(digits) or None) if digits.isdecimal() else None
 
 
 def tune_beacon(port, address, pending, hz):
@@ -1383,6 +1406,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
         with serial.Serial(port_name, baud, timeout=0.1, write_timeout=0.5) as port:
             pending = bytearray()
             next_frequency = 0.0
+            frequency = None
             last_sample = float("-inf")
             meter_available = False
             was_paused = False
@@ -1405,10 +1429,13 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     try:
                         tune_beacon(port, address, pending, beacon['hz'])
                     except ValueError as exc:
+                        frequency = None
+                        next_frequency = 0.0
                         events.put(('tune_failed', str(exc)))
                     else:
+                        frequency = beacon['hz']
+                        next_frequency = time.monotonic() + 1.0
                         events.put(('tuned', beacon))
-                    next_frequency = 0.0
                     last_sample = float('-inf')
                     continue
                 if pause.is_set():
@@ -1420,6 +1447,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     next_frequency = 0.0
                     last_sample = float('-inf')
                     was_paused = False
+                sample = None
                 if started - last_sample >= sample_interval():
                     value = read_meter(port, address, pending)
                     if pause.is_set():
@@ -1427,7 +1455,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                         continue
                     last_sample = started
                     meter_available = value is not None
-                    events.put(('sample', (time.monotonic(), value)))
+                    sample = time.monotonic(), value
                 if started >= next_frequency and not stop.is_set() and not pause.is_set():
                     frequency = None
                     if meter_available:
@@ -1437,6 +1465,8 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                             pass
                     events.put(('frequency', frequency))
                     next_frequency = started + 1.0
+                if sample is not None:
+                    events.put(('sample', (*sample, frequency if sample[1] is not None else None)))
                 stop.wait(min(0.1, max(0, last_sample + sample_interval() - time.monotonic())))
     except (OSError, serial.SerialException) as exc:
         port_failed = True
@@ -1549,6 +1579,7 @@ class Plotter(tk.Tk):
         self.auto_connecting = False
         self.auto_connect_job = None
         self.current_hz = None
+        self.tuned_beacon = None
         self.baud = tk.StringVar(value=settings.get('baud', '115200'))
         model, address = radio_setup(settings)
         saved_ports = settings.get('radio_ports', {})
@@ -1677,7 +1708,12 @@ class Plotter(tk.Tk):
         menu.add_separator()
         menu.add_command(label='Export CSV…', command=self.export_csv)
         files.configure(menu=menu)
-        ttk.Button(readouts, text='Map', command=self.open_beacon_map).pack(side='left', padx=(8, 0))
+        map_button = ttk.Menubutton(readouts, text='Map')
+        map_button.pack(side='left', padx=(8, 0))
+        map_menu = tk.Menu(map_button, tearoff=False)
+        map_menu.add_command(label='Google Maps and elevation', command=self.open_beacon_map)
+        map_menu.add_command(label='OK1CDJ PathProfile', command=self.open_path_profile)
+        map_button.configure(menu=map_menu)
         ttk.Button(readouts, text='Synoptic', command=self.open_synoptic_chart).pack(side='left', padx=(8, 0))
         ttk.Button(readouts, text='Hepburn Chart', command=self.open_hepburn_chart).pack(
             side='left', padx=(8, 0))
@@ -1899,10 +1935,20 @@ class Plotter(tk.Tk):
 
     def show_frequency(self, hz):
         self.current_hz = hz
+        if self.tuned_beacon is not None and hz != self.tuned_beacon[0]:
+            self.tuned_beacon = None
         self.frequency.set(format_radio_frequency(hz))
         self.sync_beacon()
 
-    def open_beacon_map(self):
+    def callsign_for_frequency(self, hz):
+        if hz is None:
+            return None
+        if self.tuned_beacon is not None and hz == self.tuned_beacon[0]:
+            return self.tuned_beacon[1]
+        matches = {beacon['callsign'] for beacon in self.beacons if beacon['hz'] == hz}
+        return matches.pop() if len(matches) == 1 else None
+
+    def beacon_map_details(self):
         index = self.beacon_picker.current()
         if not 0 <= index < len(self.beacons):
             messagebox.showinfo('Beacon map', 'Select a beacon to map.', parent=self)
@@ -1918,8 +1964,24 @@ class Plotter(tk.Tk):
             messagebox.showinfo('Beacon map', 'Enter a valid Maidenhead locator for this beacon.', parent=self)
             return
         station_name = self.station_callsign or 'Station'
-        details = (station_name, beacon['callsign'], self.station_coordinates, destination,
-                   format_beacon_path(self.station_coordinates, locator))
+        return (station_name, beacon['callsign'], self.station_coordinates, destination,
+                format_beacon_path(self.station_coordinates, locator))
+
+    def open_path_profile(self):
+        details = self.beacon_map_details()
+        if details is None:
+            return
+        _, _, origin, destination, _ = details
+        try:
+            if not webbrowser.open(path_profile_url(origin, destination)):
+                raise OSError('The default browser could not be opened.')
+        except OSError as exc:
+            messagebox.showwarning('Beacon map', str(exc), parent=self)
+
+    def open_beacon_map(self):
+        details = self.beacon_map_details()
+        if details is None:
+            return
         if not self.google_maps_key:
             result = MapKeyDialog(self, '', opening_map=True).result
             if result is None:
@@ -2351,7 +2413,7 @@ class Plotter(tk.Tk):
                     if value is not None:
                         self.radio_verified = True
                     if payload[0] >= self.plot_cleared_at:
-                        self.history.append(payload)
+                        self.history.append((*payload, self.callsign_for_frequency(payload[2])))
                     self.set_radio_responding(value is not None and self.stop is not None and not self.stop.is_set())
                     self.readout.set(f"Raw CI-V  {'—' if value is None else value}")
                     if not self.tuning and not self.pause.is_set():
@@ -2364,11 +2426,12 @@ class Plotter(tk.Tk):
                     self.show_frequency(payload)
                 elif kind == 'plot_gap':
                     if payload >= self.plot_cleared_at:
-                        self.history.append((payload, None))
+                        self.history.append((payload, None, None, None))
                 elif kind in ('tuned', 'tune_failed'):
                     self.tuning = False
                     self.beacon_picker.configure(state='readonly')
                     if kind == 'tuned':
+                        self.tuned_beacon = payload['hz'], payload['callsign']
                         self.show_frequency(payload['hz'])
                         suffix = ' · paused' if self.pause.is_set() else ''
                         self.status.set(f"Tuned to {payload['callsign']} · CW / Filter 1{suffix}")
@@ -2417,7 +2480,7 @@ class Plotter(tk.Tk):
                         widget.configure(state='normal')
                     if recover:
                         if self.history:
-                            self.history.append((time.monotonic(), None))
+                            self.history.append((time.monotonic(), None, None, None))
                         self.start_radio_auto_connect(preserve_history=True)
         except Empty:
             pass
@@ -2455,7 +2518,8 @@ class Plotter(tk.Tk):
         return Path(path) if path else None
 
     def timestamped_samples(self):
-        return [(timestamp + self.time_offset, raw) for timestamp, raw in self.history]
+        return [(timestamp + self.time_offset, raw, hz, callsign)
+                for timestamp, raw, hz, callsign in self.history]
 
     def save_plot(self):
         path = self.choose_plot_output('.bplot', 'Beacon plot')
@@ -2733,40 +2797,59 @@ class Plotter(tk.Tk):
             canvas.create_text(label_x, bottom + 12 + row * 14, text=label, fill=palette['text'])
         canvas.create_text(left, 12, text=axis_title, anchor='w', fill=palette['text'])
         columns = {}
+        frequency_markers = {}
+        last_marker = None
         visible = []
         count = SMOOTHING_WINDOWS[self.smoothing.get()]
         warmup = count - 1
-        for timestamp, raw in reversed(self.history):
+        for reading in reversed(self.history):
+            timestamp = reading[0]
             if timestamp > now:
                 continue
             if timestamp < now - span:
                 if warmup == 0:
                     break
                 warmup -= 1
-            visible.append((timestamp, raw))
-        for timestamp, raw in smooth_samples(reversed(visible), count):
+            visible.append(reading)
+        for timestamp, raw, hz, callsign in smooth_samples(reversed(visible), count):
             if timestamp < now - span:
                 continue
             column = round(right - (now - timestamp) / span * (right - left))
             if raw is None:
                 columns.setdefault(column, []).append(None)
                 continue
+            if hz is not None and (hz, callsign) != last_marker:
+                changed = last_marker is not None and last_marker[0] != hz
+                frequency_markers[column] = hz, changed, callsign
+                last_marker = hz, callsign
             segments = columns.setdefault(column, [])
-            if not segments or segments[-1] is None:
-                segments.append([raw, raw, raw, raw])
+            if not segments or segments[-1] is None or segments[-1][0] != hz:
+                segments.append([hz, raw, raw, raw, raw])
             else:
                 limits = segments[-1]
-                limits[1] = min(limits[1], raw)
-                limits[2] = max(limits[2], raw)
-                limits[3] = raw
+                limits[2] = min(limits[2], raw)
+                limits[3] = max(limits[3], raw)
+                limits[4] = raw
+
+        theme_index = int(theme == 'Night')
+        band_colours = {band: colours[theme_index] for band, colours in TRACE_BAND_COLOURS.items()}
+        for column, (hz, changed, _) in frequency_markers.items():
+            if changed:
+                colour = band_colours.get(beacon_band(hz), palette['muted'])
+                canvas.create_line(column, top, column, bottom, fill=colour, dash=(3, 4))
 
         previous = None
+        previous_hz = None
         for column, segments in columns.items():
             for segment in segments:
                 if segment is None:
                     previous = None
                     continue
-                first, low, high, last = segment
+                hz, first, low, high, last = segment
+                if previous_hz != hz:
+                    previous = None
+                previous_hz = hz
+                band_colour = band_colours.get(beacon_band(hz))
                 for raw in (first, low, high, last):
                     point = (column, y(positions[raw]), raw)
                     if point == previous:
@@ -2774,11 +2857,31 @@ class Plotter(tk.Tk):
                     if previous is None and point[1] >= top:
                         x, height, _ = point
                         canvas.create_oval(x - 1, height - 1, x + 1, height + 1,
-                                           fill=trace_colours[raw], outline='')
+                                           fill=band_colour or trace_colours[raw], outline='')
                     elif previous is not None and (segment_on_screen := visible_trace_segment(previous, point, top)):
-                        colour = trace_colours[round((previous[2] + raw) / 2)]
+                        colour = band_colour or trace_colours[round((previous[2] + raw) / 2)]
                         canvas.create_line(*segment_on_screen, fill=colour, width=2)
                     previous = point
+
+        label_right = left
+        for column, (hz, _, callsign) in frequency_markers.items():
+            frequency = f'{hz / 1_000_000:.6f}'.rstrip('0').rstrip('.')
+            colour = band_colours.get(beacon_band(hz), palette['text'])
+            text = f'{frequency} MHz'
+            if callsign:
+                text += f'\n{callsign}'
+            label = canvas.create_text(column + 4, top + 3, text=text, anchor='nw', justify='left',
+                                       font=('Segoe UI', 9, 'bold'), fill=colour)
+            x0, y0, x1, y1 = canvas.bbox(label)
+            shift = min(0, right - x1 - 3)
+            if x0 + shift < label_right:
+                canvas.delete(label)
+                continue
+            canvas.move(label, shift, 0)
+            background = canvas.create_rectangle(x0 + shift, y0, x1 + shift, y1,
+                                                 fill=palette['panel'], outline='')
+            canvas.tag_lower(background, label)
+            label_right = x1 + shift + 6
 
     def remember_port(self, value):
         if value is None:
