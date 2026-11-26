@@ -5,7 +5,7 @@ import re
 from urllib.request import Request, urlopen
 
 
-APP_VERSION = '1.0.8'
+APP_VERSION = '1.0.9'
 REPOSITORY = 'AM3FS/Beacon-Strength-Plotter'
 RELEASES_URL = f'https://github.com/{REPOSITORY}/releases'
 LATEST_RELEASE_API = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'

@@ -1,4 +1,5 @@
 """Standalone receive S-meter history for Icom CI-V radios."""
+from bisect import bisect_left, bisect_right
 from collections import deque
 import csv
 import ctypes
@@ -12,7 +13,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from threading import Event, Thread
 import time
 import tkinter as tk
@@ -22,6 +23,7 @@ from urllib.request import Request, urlopen
 import webbrowser
 
 from beacon_map import MAP_ORIGIN, MY_MAPS_URL, BeaconMapServer, map_page, path_profile_url, write_path_kml
+from plot_tools import DailyRecording, LiftDetector, alert_preferences, align_recording, utc_day
 from station_location import beacon_path, country_at, maidenhead_coordinates
 from updates import APP_VERSION, check_latest_release
 from vkspotter import BEACONS_URL, clipboard_beacons, fetch_beacons, listed_frequency_hz
@@ -245,6 +247,7 @@ SMOOTHING_WINDOWS = {'Off': 1, 'Light (3 samples)': 3, 'Medium (5 samples)': 5,
 LEGACY_PLOT_FORMAT = 'vk3fs-beacon-plot-v1'
 FREQUENCY_PLOT_FORMAT = 'vk3fs-beacon-plot-v2'
 PLOT_FORMAT = 'vk3fs-beacon-plot-v3'
+PLOT_COMMENT_LIMIT = 120
 
 
 def smooth_samples(samples, count):
@@ -296,7 +299,20 @@ def read_plot(path):
             raise ValueError('The plot file contains an invalid beacon callsign.')
         history.append((stamp, raw, hz, callsign))
         previous = stamp
-    return model, history
+    stored_comments = data.get('comments', [])
+    comments = {}
+    if not isinstance(stored_comments, list):
+        raise ValueError('The plot file contains invalid comments.')
+    for item in stored_comments:
+        if not isinstance(item, list) or len(item) != 2:
+            raise ValueError('The plot file contains an invalid comment.')
+        stamp, text = item
+        if (type(stamp) not in (int, float) or not 0 <= stamp < 253402214400
+                or not isinstance(text, str) or not text.isprintable() or not text.strip()
+                or len(text) > PLOT_COMMENT_LIMIT):
+            raise ValueError('The plot file contains an invalid comment.')
+        comments[stamp] = text
+    return model, history, comments
 
 
 def write_plot_csv(path, samples):
@@ -420,6 +436,7 @@ class SetupDialog(simpledialog.Dialog):
         self.warn = tk.BooleanVar(parent, value=parent.warn_on_close)
         self.auto_connect = tk.BooleanVar(parent, value=parent.auto_connect)
         self.axis_units = tk.StringVar(parent, value=parent.axis_units.get())
+        self.show_signal_guide = tk.BooleanVar(parent, value=parent.show_signal_guide)
         self.dbm_reference = tk.StringVar(parent, value=parent.dbm_reference.get())
         self.display_mode = tk.StringVar(parent, value=parent.display_theme.get())
         self.smoothing = tk.StringVar(parent, value=parent.smoothing.get())
@@ -486,6 +503,8 @@ class SetupDialog(simpledialog.Dialog):
         ttk.Label(smoothing, text='Smoothing').pack(side='left', padx=(0, 6))
         ttk.Combobox(smoothing, textvariable=self.smoothing, values=tuple(SMOOTHING_WINDOWS),
                      width=25, state='readonly').pack(side='left')
+        ttk.Checkbutton(axis, text='Show latest signal level and guide',
+                        variable=self.show_signal_guide).pack(anchor='w', pady=(5, 0))
 
         sampling = ttk.Frame(frame)
         sampling.pack(fill='x', padx=10, pady=(8, 0))
@@ -716,7 +735,8 @@ class SetupDialog(simpledialog.Dialog):
                        self.axis_units.get(), self.dbm_reference.get(), self.display_mode.get(), self.smoothing.get(),
                        self.callsign.get().strip().upper(), self.locator.get().strip().upper(),
                        self.station_coordinates, float(self.sample_interval.get().split()[0]),
-                       manual_source.strip(), auto_bom, self.bom_chart_url, self.hepburn_source.get().strip())
+                       manual_source.strip(), auto_bom, self.bom_chart_url, self.hepburn_source.get().strip(),
+                       self.show_signal_guide.get())
 
     def destroy(self):
         self.locator.trace_remove('write', self.locator_trace)
@@ -753,6 +773,17 @@ def zoomed_meter_ticks(ceiling, *, raw, reference):
                      for position in range(0, int(ceiling) + 1, step))
     return tuple((position, f'S{position // 6}' if position <= 54 else f'+{position - 54} dB')
                  for position in range(0, int(ceiling) + 1, step))
+
+
+def signal_level_label(position, reference, *, raw_scale):
+    if raw_scale:
+        return str(position)
+    if reference is not None:
+        return f'{reference + position - 54:.0f} dBm'
+    if position <= 54:
+        s_units = f'{position / 6:.1f}'.removesuffix('.0')
+        return f'S{s_units}'
+    return f'S9+{position - 54:.0f} dB'
 
 
 def visible_trace_segment(start, end, top):
@@ -1423,6 +1454,12 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                         events.put(('audio_failed', str(exc)))
                     else:
                         events.put(('audio_set', restore_level))
+                if kind == 'scan_beacon':
+                    cancelled, argument = argument
+                    if cancelled.is_set():
+                        events.put(('tune_cancelled', None))
+                        continue
+                    kind = 'beacon'
                 if kind == 'beacon':
                     beacon = argument
                     events.put(('plot_gap', time.monotonic()))
@@ -1537,6 +1574,101 @@ def copy_window_image(widget_id):
             kernel32.GlobalFree(handle)
 
 
+class FrequencyDialog(simpledialog.Dialog):
+    def __init__(self, parent, choices, title):
+        self.choices = choices
+        super().__init__(parent, title)
+
+    def body(self, frame):
+        self.picker = ttk.Combobox(frame, values=list(self.choices), state='readonly', width=36)
+        self.picker.current(0)
+        self.picker.pack(padx=12, pady=10)
+        return self.picker
+
+    def apply(self):
+        self.result = (self.choices[self.picker.get()],)
+
+
+class ScanDialog(simpledialog.Dialog):
+    def __init__(self, parent, beacons, selected, dwell):
+        self.beacons, self.selected, self.dwell = beacons, selected, dwell
+        super().__init__(parent, 'Scan beacons')
+
+    def body(self, frame):
+        ttk.Label(frame, text='Select two or more frequencies. Use Ctrl-click to select individual entries.').pack(
+            anchor='w', padx=10, pady=(6, 4))
+        rows = ttk.Frame(frame)
+        rows.pack(fill='both', expand=True, padx=10)
+        self.list = tk.Listbox(rows, selectmode='extended', exportselection=False, width=66, height=9)
+        self.list.pack(side='left', fill='both', expand=True)
+        for index, (hz, beacon) in enumerate(self.beacons.items()):
+            self.list.insert('end', beacon_label(beacon))
+            if hz in self.selected:
+                self.list.selection_set(index)
+        bar = ttk.Scrollbar(rows, command=self.list.yview)
+        bar.pack(side='right', fill='y')
+        self.list.configure(yscrollcommand=bar.set)
+        ttk.Label(frame, text='Dwell time per frequency (seconds)').pack(anchor='w', padx=10, pady=(8, 2))
+        self.entry = ttk.Entry(frame, width=8)
+        self.entry.insert(0, str(self.dwell))
+        self.entry.pack(anchor='w', padx=10)
+        return self.list
+
+    def validate(self):
+        selected = [list(self.beacons.values())[index] for index in self.list.curselection()]
+        try:
+            dwell = int(self.entry.get())
+            valid = 5 <= dwell <= 3600 and len(selected) >= 2
+        except ValueError:
+            valid = False
+        if not valid:
+            messagebox.showinfo(self.title(), 'Choose at least two frequencies and a dwell time of 5–3600 seconds.',
+                                parent=self)
+            return False
+        self.result = selected, dwell
+        return True
+
+
+class LiftAlertDialog(simpledialog.Dialog):
+    def __init__(self, parent, beacon, rule):
+        self.beacon = beacon
+        self.rule = rule
+        super().__init__(parent, 'Beacon lift alert')
+
+    def body(self, frame):
+        ttk.Label(frame, text=beacon_label(self.beacon)).grid(row=0, columnspan=2, padx=10, pady=8)
+        self.enabled = tk.BooleanVar(self, value=self.rule is not None)
+        ttk.Checkbutton(frame, text='Enable audible alert', variable=self.enabled).grid(
+            row=1, columnspan=2, sticky='w', padx=10)
+        threshold, duration = self.rule or (-110, 30)
+        self.entries = []
+        for row, (label, value) in enumerate((('Estimated dBm threshold', threshold),
+                                              ('Seconds at or above threshold', duration)), start=2):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', padx=10, pady=4)
+            entry = ttk.Entry(frame, width=8)
+            entry.grid(row=row, column=1, padx=10)
+            entry.insert(0, str(value))
+            self.entries.append(entry)
+        ttk.Label(frame, text='The estimate uses the S9 reference in Setup.').grid(
+            row=4, columnspan=2, sticky='w', padx=10, pady=4)
+        return self.entries[0]
+
+    def validate(self):
+        if not self.enabled.get():
+            self.result = (None,)
+            return True
+        try:
+            threshold, duration = (int(entry.get()) for entry in self.entries)
+            if -200 <= threshold <= 50 and 1 <= duration <= 3600:
+                self.result = ([threshold, duration],)
+                return True
+        except ValueError:
+            pass
+        messagebox.showinfo(self.title(), 'Enter a threshold from −200 to 50 dBm and a duration from 1 to 3600 seconds.',
+                            parent=self)
+        return False
+
+
 class Plotter(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1550,6 +1682,22 @@ class Plotter(tk.Tk):
         self.minsize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT)
         self.events = Queue()
         self.history = deque()
+        self.plot_comments = {}
+        self.plot_view = None
+        self.comment_hitboxes = []
+        self.measurement = []
+        self.measuring = False
+        self.measurement_candidates = []
+        self.comparison = None
+        self.focus_frequency = None
+        self.scan_beacons = []
+        self.scan_index = 0
+        self.scan_job = None
+        self.scan_cancel = None
+        self.recording = DailyRecording()
+        self.recording_error = ''
+        self.lift_detector = LiftDetector()
+        self.alert_status = None
         self.plot_cleared_at = float('-inf')
         self.time_offset = time.time() - time.monotonic()
         self.loaded_plot = False
@@ -1563,6 +1711,14 @@ class Plotter(tk.Tk):
         self.settings_path = settings_file()
         first_run = not self.settings_path.exists()
         settings = load_settings(self.settings_path)
+        self.lift_alerts = alert_preferences(settings.get('lift_alerts'))
+        folder = settings.get('recording_folder')
+        self.recording_folder = Path(folder) if isinstance(folder, str) and folder.strip() else None
+        scan_frequencies = settings.get('scan_frequencies', [])
+        self.scan_frequencies = ([hz for hz in scan_frequencies if type(hz) is int]
+                                 if isinstance(scan_frequencies, list) else [])
+        dwell = settings.get('scan_dwell')
+        self.scan_dwell = dwell if type(dwell) is int and 5 <= dwell <= 3600 else 15
         smoothing = settings.get('smoothing')
         self.smoothing = tk.StringVar(value=smoothing if smoothing in tuple(SMOOTHING_WINDOWS) else 'Off')
         saved_theme = settings.get('display_theme')
@@ -1593,6 +1749,7 @@ class Plotter(tk.Tk):
         self.address = tk.StringVar(value=address)
         units = settings.get('axis_units')
         self.axis_units = tk.StringVar(value=units if units in AXIS_UNITS else AXIS_UNITS[0])
+        self.show_signal_guide = settings.get('show_signal_guide') is not False
         reference = settings.get('dbm_reference')
         self.dbm_reference = tk.StringVar(value=reference if reference in tuple(DBM_REFERENCES) else DEFAULT_DBM_REFERENCE)
         transparency = settings.get('plot_transparency')
@@ -1705,6 +1862,8 @@ class Plotter(tk.Tk):
         menu = tk.Menu(files, tearoff=False)
         menu.add_command(label='Save plot…', command=self.save_plot)
         menu.add_command(label='Open saved plot…', command=self.open_plot)
+        menu.add_command(label='Compare saved plot…', command=self.open_comparison)
+        menu.add_command(label='Remove comparison', command=self.remove_comparison)
         menu.add_separator()
         menu.add_command(label='Export CSV…', command=self.export_csv)
         files.configure(menu=menu)
@@ -1725,6 +1884,17 @@ class Plotter(tk.Tk):
         help_menu.add_command(label='Operating Guide',
                               command=lambda: self.open_guide('Beacon-Plotter-Operating-Guide.pdf'))
         help_button.configure(menu=help_menu)
+        tools_button = ttk.Menubutton(readouts, text='Tools')
+        tools_button.pack(side='left', padx=(8, 0))
+        tools_menu = tk.Menu(tools_button, tearoff=False)
+        for label, command in (
+            ('Measure two points', self.start_measurement), ('Clear measurement', self.clear_measurement),
+            ('Beacon lift alert…', self.configure_lift_alert), ('Start daily recording…', self.start_recording),
+            ('Stop daily recording', self.stop_recording), ('Scan beacons…', self.start_scan),
+            ('Stop scanning', self.stop_scan), ('Filter plot by frequency…', self.choose_focus_frequency),
+        ):
+            tools_menu.add_command(label=label, command=command)
+        tools_button.configure(menu=tools_menu)
         self.mute_button = ttk.Button(readouts, text='Mute radio', state='disabled',
                                       command=self.toggle_radio_mute)
         self.mute_button.pack(side='right', padx=(8, 0))
@@ -1750,6 +1920,8 @@ class Plotter(tk.Tk):
         self.screenshot_button.pack(side='right', padx=(0, 6))
         self.chart = tk.Canvas(self, highlightthickness=0)
         self.chart.wallpaper_photo = None
+        self.signal_level_font = font.Font(root=self, family='Segoe UI', size=9, weight='bold')
+        self.plot_comment_menu = tk.Menu(self.chart, tearoff=False)
         self.chart.grid(row=4, column=0, columnspan=2, sticky='nsew', padx=22)
         self.y_zoom = tk.IntVar(self, value=1)
         self.y_zoom_controls = ttk.Frame(self.chart, padding=(3, 3))
@@ -1761,6 +1933,8 @@ class Plotter(tk.Tk):
                                       command=self.change_y_zoom)
         self.y_zoom_slider.pack(fill='y', expand=True)
         self.chart.bind('<MouseWheel>', self.wheel_zoom)
+        self.chart.bind('<Button-3>', self.open_plot_comment_menu)
+        self.chart.bind('<Button-1>', self.place_measurement_cursor)
         self.history_scroll = ttk.Scrollbar(self, orient='horizontal', command=self.scroll_history)
         self.history_scroll.grid(row=5, column=0, columnspan=2, sticky='ew', padx=22)
         self.chart.bind('<Configure>', lambda event: self.draw())
@@ -1777,6 +1951,7 @@ class Plotter(tk.Tk):
         self.refresh_ports()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self.after(100, self.poll)
+        self.after(15_000, self.recording_tick)
         self.after(1000, self.update_display_clock)
         if first_run:
             self.after_idle(self.prompt_first_run_station)
@@ -2089,12 +2264,68 @@ class Plotter(tk.Tk):
             return
         beacon = self.beacons[index]
         self.beacon_path_label.set(format_beacon_path(self.station_coordinates, beacon.get('locator'), labelled=True))
-        if self.stop is None or self.stop.is_set() or self.auto_connecting:
-            return
+        self.stop_scan()
+        self.queue_beacon_tune(beacon)
+
+    def queue_beacon_tune(self, beacon, *, scanning=False):
+        if self.stop is None or self.stop.is_set() or self.auto_connecting or self.tuning:
+            return False
+        request = ('scan_beacon', (self.scan_cancel, beacon)) if scanning else ('beacon', beacon)
+        try:
+            self.radio_requests.put_nowait(request)
+        except Full:
+            return False
         self.tuning = True
         self.beacon_picker.configure(state='disabled')
         self.status.set(f"Tuning to {beacon['callsign']}…")
-        self.radio_requests.put_nowait(('beacon', beacon))
+        return True
+
+    def start_scan(self):
+        if self.stop is None or self.stop.is_set() or not self.radio_verified or self.pause.is_set() or self.tuning:
+            messagebox.showinfo('Scan beacons', 'Connect the radio and resume sampling before scanning.', parent=self)
+            return
+        beacons = {}
+        for beacon in self.beacons:
+            beacons.setdefault(beacon['hz'], beacon)
+        if len(beacons) < 2:
+            messagebox.showinfo('Scan beacons', 'Save at least two beacon frequencies first.', parent=self)
+            return
+        result = ScanDialog(self, beacons, self.scan_frequencies, self.scan_dwell).result
+        if result is None or self.stop is None or self.stop.is_set():
+            return
+        self.stop_scan()
+        self.scan_beacons, self.scan_dwell = result
+        self.scan_frequencies = [beacon['hz'] for beacon in self.scan_beacons]
+        self.scan_cancel = Event()
+        self.scan_index = 0
+        self.persist_settings()
+        if not self.tuning:
+            self.scan_step()
+
+    def scan_step(self):
+        self.scan_job = None
+        if not self.scan_beacons or self.pause.is_set():
+            return
+        beacon = self.scan_beacons[self.scan_index]
+        if not self.queue_beacon_tune(beacon, scanning=True):
+            self.stop_scan()
+            return
+        self.scan_index = (self.scan_index + 1) % len(self.scan_beacons)
+
+    def schedule_scan_step(self):
+        if self.scan_beacons and not self.pause.is_set() and self.scan_job is None:
+            self.scan_job = self.after(self.scan_dwell * 1000, self.scan_step)
+
+    def stop_scan(self):
+        if self.scan_job is not None:
+            self.after_cancel(self.scan_job)
+            self.scan_job = None
+        if self.scan_cancel is not None:
+            self.scan_cancel.set()
+            self.scan_cancel = None
+        self.scan_beacons = []
+        if self.active_theme is not None:
+            self.update_footer()
 
     def manage_beacons(self):
         window = tk.Toplevel(self)
@@ -2229,6 +2460,197 @@ class Plotter(tk.Tk):
         self.view_end = None
         self.draw()
 
+    def start_measurement(self):
+        if not self.history:
+            messagebox.showinfo('Measure two points', 'Record or open a plot first.', parent=self)
+            return
+        self.measurement.clear()
+        self.measuring = True
+        self.chart.configure(cursor='crosshair')
+        self.draw()
+
+    def clear_measurement(self, *, redraw=True):
+        self.measuring = False
+        self.measurement.clear()
+        self.chart.configure(cursor='')
+        if redraw:
+            self.draw()
+
+    def place_measurement_cursor(self, event):
+        if not self.measuring or not self.measurement_candidates:
+            return
+        left, top, right, bottom, start, end = self.plot_view
+        if not (left <= event.x <= right and top <= event.y <= bottom):
+            return
+        stamp = start + (event.x - left) / (right - left) * (end - start)
+        tolerance = (end - start) / (right - left)
+        if not self.measurement_candidates[0][0] - tolerance <= stamp <= self.measurement_candidates[-1][0] + tolerance:
+            return
+        sample = min(self.measurement_candidates, key=lambda reading: abs(reading[0] - stamp))
+        if self.measurement and self.measurement[0][0] == sample[0]:
+            return
+        self.measurement.append(sample)
+        if len(self.measurement) == 2:
+            self.measuring = False
+            self.chart.configure(cursor='')
+        self.draw()
+        return 'break'
+
+    def measurement_status(self):
+        if self.measuring:
+            return 'Click point B on the trace.' if self.measurement else 'Click point A on the trace.'
+        if len(self.measurement) != 2:
+            return None
+        first, second = self.measurement
+        elapsed = abs(second[0] - first[0])
+        if first[2] != second[2] and first[2] is not None and second[2] is not None:
+            return f'A → B: {elapsed:.1f} s · different frequencies'
+        if self.axis_units.get() != 'dBm' and self.plot_model == 'Custom Icom':
+            delta = second[1] - first[1]
+            return f'A → B: {elapsed:.1f} s · {delta:+d} raw CI-V counts'
+        positions = IC9700_POSITIONS if self.plot_model == 'IC-9700' else STANDARD_POSITIONS
+        delta = positions[second[1]] - positions[first[1]]
+        return f'A → B: {elapsed:.1f} s · {delta:+.1f} dB'
+
+    def configure_lift_alert(self):
+        index = self.beacon_picker.current()
+        if not 0 <= index < len(self.beacons):
+            messagebox.showinfo('Beacon lift alert', 'Select a saved beacon frequency first.', parent=self)
+            return
+        beacon = self.beacons[index]
+        key = self.lift_key(beacon['hz'], beacon['callsign'])
+        result = LiftAlertDialog(self, beacon, self.lift_alerts.get(key)).result
+        if result is not None:
+            rule, = result
+            if rule is None:
+                self.lift_alerts.pop(key, None)
+            else:
+                self.lift_alerts[key] = rule
+            self.lift_detector.clear(key)
+            self.alert_status = None
+            self.persist_settings()
+            self.update_footer()
+
+    @staticmethod
+    def lift_key(hz, callsign):
+        return f'{beacon_callsign_key(callsign)}:{hz}' if callsign and hz is not None else None
+
+    def check_lift(self, sample):
+        stamp, raw, hz, callsign = sample
+        key = self.lift_key(hz, callsign)
+        rule = self.lift_alerts.get(key)
+        level = None
+        if raw is not None and rule is not None:
+            positions = IC9700_POSITIONS if self.plot_model == 'IC-9700' else STANDARD_POSITIONS
+            level = DBM_REFERENCES[self.dbm_reference.get()] + positions[raw] - 54
+        if self.lift_detector.update(key, stamp, level, rule, max_gap=2 * self.sample_interval + 1):
+            self.alert_status = (time.monotonic() + 10, f'Lift alert · {callsign} · {level:.0f} dBm')
+            if os.name == 'nt':
+                import winsound
+                try:
+                    winsound.MessageBeep()
+                except RuntimeError:
+                    self.bell()
+            else:
+                self.bell()
+            self.update_footer()
+
+    def start_recording(self):
+        directory = filedialog.askdirectory(parent=self, title='Choose the daily recording folder',
+                                            initialdir=self.recording_folder or Path.home())
+        if not directory:
+            return
+        folder = Path(directory)
+        if not self.flush_recording():
+            self.recording.redirect_pending(folder)
+            self.flush_recording()
+        self.recording_folder = folder
+        self.persist_settings()
+        self.update_footer()
+
+    def stop_recording(self):
+        self.recording_folder = None
+        self.flush_recording()
+        self.persist_settings()
+
+    def flush_recording(self):
+        errors = self.recording.flush(utc_day(time.time()), PLOT_FORMAT)
+        self.recording_error = errors[0] if errors else ''
+        self.update_footer()
+        return not errors
+
+    def recording_tick(self):
+        self.flush_recording()
+        self.after(30_000, self.recording_tick)
+
+    def record_sample(self, sample):
+        if self.recording_folder is not None:
+            stamp, raw, hz, callsign = sample
+            self.recording.append(self.recording_folder, self.plot_model,
+                                  (stamp + self.time_offset, raw, hz, callsign))
+
+    def record_comment(self, stamp, text):
+        if self.recording_folder is not None and not self.loaded_plot:
+            self.recording.comment(self.recording_folder, self.plot_model, stamp + self.time_offset, text)
+
+    def open_plot_comment_menu(self, event):
+        if not self.history or self.plot_view is None:
+            return
+        left, top, right, bottom, start, end = self.plot_view
+        if not (left <= event.x <= right and top <= event.y <= bottom):
+            return
+        stamp = start + (event.x - left) / (right - left) * (end - start)
+        for existing, column, bounds in reversed(self.comment_hitboxes):
+            if bounds is not None:
+                x0, y0, x1, y1 = bounds
+                if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                    stamp = existing
+                    break
+            if abs(event.x - column) <= 4:
+                stamp = existing
+                break
+        menu = self.plot_comment_menu
+        menu.delete(0, 'end')
+        if stamp in self.plot_comments:
+            menu.add_command(label='Edit comment…', command=lambda: self.edit_plot_comment(stamp))
+            menu.add_command(label='Delete comment', command=lambda: self.delete_plot_comment(stamp))
+        else:
+            # A pixel can represent several seconds at wide zoom levels.
+            tolerance = (end - start) / (right - left) / 2
+            oldest, newest = self.history[0][0], self.history[-1][0]
+            if not oldest - tolerance <= stamp <= newest + tolerance:
+                return
+            stamp = min(newest, max(oldest, stamp))
+            menu.add_command(label='Add comment…', command=lambda: self.edit_plot_comment(stamp))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    def edit_plot_comment(self, stamp):
+        clock = datetime.fromtimestamp(stamp + self.time_offset).strftime('%H:%M:%S')
+        initial = self.plot_comments.get(stamp, '')
+        while True:
+            text = simpledialog.askstring(
+                'Plot comment', f'Comment at {clock} local time (up to {PLOT_COMMENT_LIMIT} characters)',
+                initialvalue=initial, parent=self,
+            )
+            if text is None or not text.strip():
+                return
+            initial = ' '.join(text.split())
+            if len(initial) <= PLOT_COMMENT_LIMIT and initial.isprintable():
+                self.plot_comments[stamp] = initial
+                self.record_comment(stamp, initial)
+                self.draw()
+                return
+            messagebox.showwarning('Plot comment', 'Enter a shorter comment using printable text.', parent=self)
+
+    def delete_plot_comment(self, stamp):
+        self.plot_comments.pop(stamp, None)
+        self.record_comment(stamp, None)
+        self.draw()
+
     def clear_plot(self):
         if not self.history or not messagebox.askyesno(
             'Clear Plot', 'Are you sure you want to clear the current plot?', parent=self, default=messagebox.NO,
@@ -2236,6 +2658,10 @@ class Plotter(tk.Tk):
             return
         self.plot_cleared_at = time.monotonic()
         self.history.clear()
+        self.plot_comments.clear()
+        self.clear_measurement(redraw=False)
+        self.comparison = None
+        self.focus_frequency = None
         self.view_end = None
         if self.loaded_plot:
             self.loaded_plot = False
@@ -2252,26 +2678,39 @@ class Plotter(tk.Tk):
             self.pause.clear()
             self.pause_button.configure(text='Pause')
             self.status.set('Resuming meter readings…')
+            if not self.tuning:
+                self.schedule_scan_step()
         else:
             self.pause.set()
             self.pause_time = time.monotonic()
             self.pause_button.configure(text='Resume')
             self.status.set('Paused · captured readings are retained.')
+            self.lift_detector.reset()
+            if self.scan_job is not None:
+                self.after_cancel(self.scan_job)
+                self.scan_job = None
         self.draw()
 
     def latest_time(self):
+        if self.comparison is not None:
+            return max(self.history[-1][0], self.comparison[1][-1][0])
         if self.pause_time is not None:
             return self.pause_time
         if self.stop is None and self.history:
             return self.history[-1][0]
         return time.monotonic()
 
+    def oldest_plot_time(self, latest):
+        if self.comparison is not None:
+            return min(self.history[0][0], self.comparison[1][0][0])
+        return self.history[0][0] if self.history else latest
+
     def scroll_history(self, action, value, unit=None):
         if not self.history:
             return
         latest = self.latest_time()
         span = TIME_WINDOWS[self.window_index.get()][0]
-        oldest = self.history[0][0]
+        oldest = self.oldest_plot_time(latest)
         if latest - oldest <= span:
             return
         if action == 'moveto':
@@ -2335,6 +2774,7 @@ class Plotter(tk.Tk):
         if not automatic:
             self.cancel_radio_auto_connect()
         if self.stop is not None:
+            self.stop_scan()
             self.stop.set()
             self.set_radio_responding(False)
             self.connect.configure(state='disabled')
@@ -2357,6 +2797,10 @@ class Plotter(tk.Tk):
             return
         if not preserve_history:
             self.history.clear()
+            self.plot_comments.clear()
+            self.clear_measurement(redraw=False)
+            self.comparison = None
+            self.focus_frequency = None
             self.time_offset = time.time() - time.monotonic()
             self.view_end = None
         self.loaded_plot = False
@@ -2413,7 +2857,11 @@ class Plotter(tk.Tk):
                     if value is not None:
                         self.radio_verified = True
                     if payload[0] >= self.plot_cleared_at:
-                        self.history.append((*payload, self.callsign_for_frequency(payload[2])))
+                        sample = (*payload, self.callsign_for_frequency(payload[2]))
+                        self.history.append(sample)
+                        self.record_sample(sample)
+                        if not self.pause.is_set():
+                            self.check_lift(sample)
                     self.set_radio_responding(value is not None and self.stop is not None and not self.stop.is_set())
                     self.readout.set(f"Raw CI-V  {'—' if value is None else value}")
                     if not self.tuning and not self.pause.is_set():
@@ -2425,9 +2873,12 @@ class Plotter(tk.Tk):
                 elif kind == 'frequency':
                     self.show_frequency(payload)
                 elif kind == 'plot_gap':
+                    self.lift_detector.reset()
                     if payload >= self.plot_cleared_at:
-                        self.history.append((payload, None, None, None))
-                elif kind in ('tuned', 'tune_failed'):
+                        gap = (payload, None, None, None)
+                        self.history.append(gap)
+                        self.record_sample(gap)
+                elif kind in ('tuned', 'tune_failed', 'tune_cancelled'):
                     self.tuning = False
                     self.beacon_picker.configure(state='readonly')
                     if kind == 'tuned':
@@ -2435,7 +2886,9 @@ class Plotter(tk.Tk):
                         self.show_frequency(payload['hz'])
                         suffix = ' · paused' if self.pause.is_set() else ''
                         self.status.set(f"Tuned to {payload['callsign']} · CW / Filter 1{suffix}")
-                    else:
+                        self.schedule_scan_step()
+                    elif kind == 'tune_failed':
+                        self.stop_scan()
                         self.show_frequency(None)
                         messagebox.showwarning('Tune beacon', payload, parent=self)
                 elif kind in ('audio_set', 'audio_failed'):
@@ -2456,6 +2909,15 @@ class Plotter(tk.Tk):
                     self.readout.set('Raw CI-V  —')
                 elif kind == 'closed':
                     recover = payload and self.auto_connect and self.radio_verified and not self.stop.is_set()
+                    self.stop_scan()
+                    self.lift_detector.clear()
+                    self.alert_status = None
+                    if self.history:
+                        gap = (time.monotonic(), None, None, None)
+                        self.record_sample(gap)
+                        if recover:
+                            self.history.append(gap)
+                    self.flush_recording()
                     self.set_radio_responding(False)
                     if self.auto_connecting and self.auto_connect_job is not None:
                         self.status.set(f'Waiting for the radio on {self.port.get()}. Retrying automatically…')
@@ -2479,8 +2941,6 @@ class Plotter(tk.Tk):
                     for widget in (*self.inputs, self.refresh):
                         widget.configure(state='normal')
                     if recover:
-                        if self.history:
-                            self.history.append((time.monotonic(), None, None, None))
                         self.start_radio_auto_connect(preserve_history=True)
         except Empty:
             pass
@@ -2494,7 +2954,16 @@ class Plotter(tk.Tk):
         width, height = self.footer.winfo_width(), self.footer.winfo_height()
         colour = DISPLAY_THEMES[self.active_theme]['text']
         self.footer.delete('readouts')
-        self.footer.create_text(12, height / 2, text=self.status.get(), anchor='w',
+        status = self.measurement_status() or self.status.get()
+        if self.alert_status and time.monotonic() < self.alert_status[0]:
+            status = self.alert_status[1]
+        if self.recording_error:
+            status = 'Daily recording failed · ' + self.recording_error
+        elif self.recording_folder is not None:
+            status += ' · Daily recording armed' if self.stop is None else ' · Daily recording'
+        if self.scan_beacons:
+            status += ' · Scanning'
+        self.footer.create_text(12, height / 2, text=status, anchor='w',
                                 fill=colour, tags='readouts')
         self.footer.create_text(width - 12, height / 2, text=self.readout.get(), anchor='e',
                                 fill=colour, tags='readouts')
@@ -2527,7 +2996,9 @@ class Plotter(tk.Tk):
             return
         try:
             save_settings(path, {'format': PLOT_FORMAT, 'radio_model': self.plot_model,
-                                 'samples': self.timestamped_samples()})
+                                 'samples': self.timestamped_samples(),
+                                 'comments': [(stamp + self.time_offset, text)
+                                              for stamp, text in sorted(self.plot_comments.items())]})
         except OSError as exc:
             messagebox.showwarning('Save plot', str(exc), parent=self)
 
@@ -2540,7 +3011,7 @@ class Plotter(tk.Tk):
         if not path:
             return
         try:
-            model, history = read_plot(Path(path))
+            model, history, comments = read_plot(Path(path))
         except (OSError, ValueError, RecursionError) as exc:
             messagebox.showwarning('Open saved plot', str(exc), parent=self)
             return
@@ -2549,6 +3020,10 @@ class Plotter(tk.Tk):
         ):
             return
         self.history = history
+        self.plot_comments = comments
+        self.clear_measurement(redraw=False)
+        self.comparison = None
+        self.focus_frequency = None
         self.loaded_plot = True
         self.time_offset = 0
         self.plot_model = model
@@ -2559,6 +3034,73 @@ class Plotter(tk.Tk):
         self.window_index.set(index)
         self.status.set(f'Saved plot · {Path(path).name}')
         self.change_window(index)
+
+    @staticmethod
+    def recording_frequencies(samples):
+        return {hz for _, raw, hz, _ in samples if raw is not None and hz is not None}
+
+    @staticmethod
+    def frequency_choices(frequencies):
+        return {f'{hz / 1_000_000:.6f}'.rstrip('0').rstrip('.') + ' MHz': hz
+                for hz in sorted(frequencies)}
+
+    def choose_focus_frequency(self):
+        if self.comparison is not None:
+            messagebox.showinfo('Filter plot', 'Remove the comparison to change the plot frequency filter.',
+                                parent=self)
+            return
+        choices = {'All frequencies': None, **self.frequency_choices(
+            self.recording_frequencies(self.history) | {beacon['hz'] for beacon in self.beacons})}
+        dialog = FrequencyDialog(self, choices, 'Filter plot by frequency')
+        if dialog.result is not None:
+            self.focus_frequency, = dialog.result
+            self.clear_measurement(redraw=False)
+            self.draw()
+
+    def open_comparison(self):
+        if not self.loaded_plot:
+            messagebox.showinfo('Compare saved plots', 'Open the first saved plot before choosing a comparison.',
+                                parent=self)
+            return
+        path = filedialog.askopenfilename(parent=self, title='Choose a comparison plot',
+                                          filetypes=[('Beacon plot', '*.bplot')])
+        if not path:
+            return
+        try:
+            model, samples, _ = read_plot(Path(path))
+        except (OSError, ValueError, RecursionError) as exc:
+            messagebox.showwarning('Compare saved plots', str(exc), parent=self)
+            return
+        matching = self.recording_frequencies(self.history) & self.recording_frequencies(samples)
+        if not matching:
+            messagebox.showinfo('Compare saved plots', 'The two plots have no matching recorded frequency.',
+                                parent=self)
+            return
+        if len(matching) == 1:
+            hz, = matching
+        else:
+            result = FrequencyDialog(self, self.frequency_choices(matching), 'Choose the comparison frequency').result
+            if result is None:
+                return
+            hz, = result
+        aligned = align_recording(self.history[0][0], samples)
+        self.comparison = (model, aligned, hz, Path(path).name)
+        self.clear_measurement(redraw=False)
+        self.status.set(f'Comparison · {Path(path).name} · aligned by UTC time of day')
+        latest = self.latest_time()
+        duration = latest - self.oldest_plot_time(latest)
+        index = next((i for i, (span, _, _) in enumerate(TIME_WINDOWS) if span >= duration),
+                     len(TIME_WINDOWS) - 1)
+        self.view_end = None
+        self.window_index.set(index)
+        self.change_window(index)
+
+    def remove_comparison(self):
+        if self.comparison is not None:
+            self.comparison = None
+            self.clear_measurement(redraw=False)
+            self.status.set('Comparison removed.')
+            self.draw()
 
     def export_csv(self):
         path = self.choose_plot_output('.csv', 'CSV files')
@@ -2581,7 +3123,7 @@ class Plotter(tk.Tk):
             (self.plot_transparency, self.warn_on_close, self.auto_connect,
              units, reference, mode, smoothing, self.station_callsign, self.station_locator,
              self.station_coordinates, self.sample_interval, synoptic_source, synoptic_auto_bom,
-             bom_chart_url, self.hepburn_source) = result
+             bom_chart_url, self.hepburn_source, self.show_signal_guide) = result
             if not self.auto_connect and self.auto_connect_job is not None:
                 self.cancel_radio_auto_connect()
                 if self.auto_connecting and self.stop is not None:
@@ -2597,6 +3139,8 @@ class Plotter(tk.Tk):
                 if self.synoptic_window is not None and self.synoptic_window.winfo_exists():
                     self.synoptic_window.destroy()
             self.axis_units.set(units)
+            if self.dbm_reference.get() != reference:
+                self.lift_detector.clear()
             self.dbm_reference.set(reference)
             self.display_theme.set(mode)
             self.smoothing.set(smoothing)
@@ -2741,10 +3285,13 @@ class Plotter(tk.Tk):
         latest = self.latest_time()
         while not self.loaded_plot and self.history and latest - self.history[0][0] > HISTORY_SECONDS:
             self.history.popleft()
+        if not self.loaded_plot and self.plot_comments:
+            self.plot_comments = {stamp: text for stamp, text in self.plot_comments.items()
+                                  if stamp >= latest - HISTORY_SECONDS}
         self.clear_plot_button.configure(state='normal' if self.history else 'disabled')
         self.last_draw = self.history[-1] if self.history else None
         span, _, interval = TIME_WINDOWS[self.window_index.get()]
-        oldest = self.history[0][0] if self.history else latest
+        oldest = self.oldest_plot_time(latest)
         available = latest - oldest
         if available <= span:
             self.view_end = None
@@ -2762,8 +3309,15 @@ class Plotter(tk.Tk):
         axis_end = now + self.time_offset
         left, top = 70, 27
         bottom_margin = PLOT_STAGGERED_BOTTOM_MARGIN if stagger else PLOT_BOTTOM_MARGIN
-        right = max(left + 1, canvas.winfo_width() - 64)
+        zoom_left = canvas.winfo_width() - self.y_zoom_controls.winfo_reqwidth() - 4
+        right = zoom_left - 12
+        if self.show_signal_guide:
+            label_width = max(self.signal_level_font.measure('↑ ' + label)
+                              for label in ('S9+60 dB', '-147 dBm', '255'))
+            right -= label_width + 2
+        right = max(left + 1, right)
         bottom = max(top + 1, canvas.winfo_height() - bottom_margin)
+        self.plot_view = (left, top, right, bottom, now - span, now)
 
         positions = IC9700_POSITIONS if self.plot_model == 'IC-9700' else STANDARD_POSITIONS
         ticks = METER_TICKS
@@ -2802,6 +3356,9 @@ class Plotter(tk.Tk):
         visible = []
         count = SMOOTHING_WINDOWS[self.smoothing.get()]
         warmup = count - 1
+        last_raw = None
+        self.measurement_candidates.clear()
+        focus = self.comparison[2] if self.comparison is not None else self.focus_frequency
         for reading in reversed(self.history):
             timestamp = reading[0]
             if timestamp > now:
@@ -2814,10 +3371,15 @@ class Plotter(tk.Tk):
         for timestamp, raw, hz, callsign in smooth_samples(reversed(visible), count):
             if timestamp < now - span:
                 continue
+            if focus is not None and hz != focus:
+                raw = None
+            last_raw = raw
             column = round(right - (now - timestamp) / span * (right - left))
             if raw is None:
                 columns.setdefault(column, []).append(None)
                 continue
+            if self.measuring:
+                self.measurement_candidates.append((timestamp, raw, hz, callsign))
             if hz is not None and (hz, callsign) != last_marker:
                 changed = last_marker is not None and last_marker[0] != hz
                 frequency_markers[column] = hz, changed, callsign
@@ -2837,6 +3399,17 @@ class Plotter(tk.Tk):
             if changed:
                 colour = band_colours.get(beacon_band(hz), palette['muted'])
                 canvas.create_line(column, top, column, bottom, fill=colour, dash=(3, 4))
+
+        level = None
+        if self.show_signal_guide and last_raw is not None:
+            position = positions[last_raw]
+            height = y(position)
+            level = signal_level_label(position, reference, raw_scale=positions is RAW_POSITIONS)
+            if height >= top:
+                canvas.create_line(left, height, right, height, fill=palette['reference'], dash=(1, 3))
+            else:
+                level = '↑ ' + level
+            label_y = min(bottom - 9, max(top + 9, height))
 
         previous = None
         previous_hz = None
@@ -2863,6 +3436,12 @@ class Plotter(tk.Tk):
                         canvas.create_line(*segment_on_screen, fill=colour, width=2)
                     previous = point
 
+        if self.comparison is not None:
+            self.draw_comparison(y, count, positions is RAW_POSITIONS)
+        elif focus is not None:
+            text, = self.frequency_choices({focus})
+            canvas.create_text(right, 12, text=text, anchor='e', fill=palette['text'])
+
         label_right = left
         for column, (hz, _, callsign) in frequency_markers.items():
             frequency = f'{hz / 1_000_000:.6f}'.rstrip('0').rstrip('.')
@@ -2882,6 +3461,106 @@ class Plotter(tk.Tk):
                                                  fill=palette['panel'], outline='')
             canvas.tag_lower(background, label)
             label_right = x1 + shift + 6
+
+        self.draw_plot_comments()
+        if level is not None:
+            label = canvas.create_text(right + 6, label_y, text=level, anchor='w',
+                                       font=self.signal_level_font, fill=palette['text'])
+            x0, y0, x1, y1 = canvas.bbox(label)
+            badge = canvas.create_rectangle(x0 - 2, y0, x1 + 2, y1, fill=palette['panel'],
+                                            outline=palette['border'])
+            canvas.tag_lower(badge, label)
+        self.draw_measurement(y, positions)
+        self.update_footer()
+
+    def draw_measurement(self, y, positions):
+        left, top, right, bottom, start, end = self.plot_view
+        colour = '#006c72' if self.active_theme == 'Day' else '#8bf2e9'
+        for name, (stamp, raw, _, _) in zip(('A', 'B'), self.measurement):
+            if not start <= stamp <= end:
+                continue
+            x = left + (stamp - start) / (end - start) * (right - left)
+            self.chart.create_line(x, top, x, bottom, fill=colour, dash=(5, 3))
+            self.chart.create_text(min(right - 5, x + 7), top + 49, text=name, anchor='w',
+                                   fill=colour, font=('Segoe UI', 10, 'bold'))
+            height = y(positions[raw])
+            if top <= height <= bottom:
+                self.chart.create_oval(x - 3, height - 3, x + 3, height + 3, fill=colour, outline='')
+
+    def draw_comparison(self, y, count, raw_scale):
+        model, samples, frequency, _ = self.comparison
+        left, top, right, _, start, end = self.plot_view
+        lo = bisect_left(samples, start, key=lambda sample: sample[0])
+        hi = bisect_right(samples, end, key=lambda sample: sample[0])
+        if raw_scale:
+            positions = RAW_POSITIONS
+        else:
+            positions = IC9700_POSITIONS if model == 'IC-9700' else STANDARD_POSITIONS
+        colour = '#a92146' if self.active_theme == 'Day' else '#ff9eb8'
+        columns = []
+        for stamp, raw, hz, _ in smooth_samples(samples[max(0, lo - count + 1):hi], count):
+            if stamp < start:
+                continue
+            if raw is None or hz != frequency:
+                if columns and columns[-1] is not None:
+                    columns.append(None)
+                continue
+            x = round(left + (stamp - start) / (end - start) * (right - left))
+            if columns and columns[-1] is not None and columns[-1][0] == x:
+                column = columns[-1]
+                column[2] = min(column[2], raw)
+                column[3] = max(column[3], raw)
+                column[4] = raw
+            else:
+                columns.append([x, raw, raw, raw, raw])
+        previous = None
+        for column in columns:
+            if column is None:
+                previous = None
+                continue
+            x, *values = column
+            for raw in values:
+                point = (x, y(positions[raw]))
+                if point == previous:
+                    continue
+                if previous is None and point[1] >= top:
+                    self.chart.create_oval(x - 1, point[1] - 1, x + 1, point[1] + 1, fill=colour, outline='')
+                elif previous is not None and (segment := visible_trace_segment(previous, point, top)):
+                    self.chart.create_line(*segment, fill=colour, dash=(4, 2))
+                previous = point
+        self.chart.create_text(right, 12, text='Comparison (UTC)', anchor='e', fill=colour)
+
+    def draw_plot_comments(self):
+        self.comment_hitboxes.clear()
+        if not self.plot_comments:
+            return
+        left, top, right, bottom, start, end = self.plot_view
+        canvas = self.chart
+        palette = DISPLAY_THEMES[self.active_theme]
+        colour = '#955418' if self.active_theme == 'Day' else '#ffbf66'
+        flag_y = min(top + 42, bottom - 5)
+        label_right = left
+        for stamp, text in sorted(self.plot_comments.items()):
+            if not start <= stamp <= end:
+                continue
+            column = round(left + (stamp - start) / (end - start) * (right - left))
+            canvas.create_line(column, flag_y, column, bottom, fill=colour, dash=(2, 4))
+            canvas.create_polygon(column, flag_y - 5, column + 4, flag_y,
+                                  column, flag_y + 5, column - 4, flag_y, fill=colour)
+            label = canvas.create_text(column + 6, flag_y, text=text, anchor='nw',
+                                       width=min(230, right - left), font=('Segoe UI', 9), fill=colour)
+            x0, y0, x1, y1 = canvas.bbox(label)
+            shift = min(0, right - x1 - 3)
+            bounds = None
+            if y1 <= bottom and x0 + shift >= label_right:
+                canvas.move(label, shift, 0)
+                bounds = (x0 + shift, y0, x1 + shift, y1)
+                background = canvas.create_rectangle(*bounds, fill=palette['panel'], outline='')
+                canvas.tag_lower(background, label)
+                label_right = bounds[2] + 6
+            else:
+                canvas.delete(label)
+            self.comment_hitboxes.append((stamp, column, bounds))
 
     def remember_port(self, value):
         if value is None:
@@ -2907,6 +3586,11 @@ class Plotter(tk.Tk):
                 'sample_interval_seconds': self.sample_interval,
                 'smoothing': self.smoothing.get(),
                 'axis_units': self.axis_units.get(),
+                'show_signal_guide': self.show_signal_guide,
+                'lift_alerts': self.lift_alerts,
+                'recording_folder': str(self.recording_folder) if self.recording_folder else '',
+                'scan_frequencies': self.scan_frequencies,
+                'scan_dwell': self.scan_dwell,
                 'dbm_reference': self.dbm_reference.get(),
                 'plot_transparency': self.plot_transparency,
                 'warn_on_close': self.warn_on_close,
@@ -2927,6 +3611,11 @@ class Plotter(tk.Tk):
             default=messagebox.CANCEL, parent=self,
         ):
             return
+        if not self.flush_recording() and not messagebox.askyesno(
+            'Daily recording', 'The last recording could not be saved. Quit anyway?', parent=self,
+        ):
+            return
+        self.stop_scan()
         if self.stop is not None:
             self.stop.set()
         self.cancel_radio_auto_connect()
