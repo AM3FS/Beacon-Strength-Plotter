@@ -1,7 +1,10 @@
 VK3FS Signal Strength plotter for radio beacons
 
-Select your radio and CI-V COM port in the Radio connection panel. Selecting a named model
-fills its default CI-V address. The address and baud rate are editable.
+Select your radio and its COM port in the Radio connection panel.
+Icom presets fill the default CI-V address. For a Yaesu FTX-1 or FT-891,
+choose the Enhanced USB CAT COM port. The FTX-1 monitors Main via CAT-1
+with one stop bit. On the FT-891, disable CAT RTS and select VFO mode
+before tuning presets. Yaesu plots show raw CAT counts from 0 to 255.
 Match the baud rate configured on the radio, then click Connect.
 The COM port list refreshes when you open the dropdown or click Refresh ports.
 On Windows it includes virtual ports exposed as COM names, such as COM21.
@@ -70,7 +73,7 @@ The list is sorted alphabetically by callsign. An exact match to the
 reported radio frequency appears automatically in the Beacon dropdown.
 The selection clears when the frequency is unknown or has no saved match.
 Connect the radio, then select a saved beacon to set its frequency and
-CW / Filter 1. The app checks the radio's frequency and mode readback.
+CW / Filter 1 on Icom, or CW on Yaesu. The app checks frequency and mode readback.
 Callsign and location are labels. The initial VK5RSE preset uses the
 example supplied for this build: Mount Gambier, 145.550 MHz.
 

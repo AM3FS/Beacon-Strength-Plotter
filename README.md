@@ -1,10 +1,17 @@
 # Beacon Strength Plotter
 
-Beacon Strength Plotter is a Windows 10 and 11 program for monitoring and recording amateur radio beacon signals from Icom transceivers via CI-V. Plot live S-meter readings in S-units or estimated dBm, track changes in propagation, and save recordings for later comparison.
+Beacon Strength Plotter is a Windows 10 and 11 program for monitoring and recording amateur radio beacon signals from Icom and Yaesu transceivers. Track propagation changes and save recordings for later comparison. Icom profiles offer S-units or estimated dBm. Yaesu profiles show raw CAT meter counts.
 
 [Download the Windows installer](https://github.com/AM3FS/Beacon-Strength-Plotter/releases/latest) · [Quick Start](docs/Beacon-Plotter-Quick-Start.pdf) · [Operating Guide](docs/Beacon-Plotter-Operating-Guide.pdf)
 
-![Beacon Strength Plotter on Windows showing blue 144 MHz and green 432 MHz traces, frequency and callsign markers, and a right-side signal reading](beacon-strength-plotter.png)
+![Night-mode VK5RSE recording with a cyan 144.550 MHz trace, a green 432.550 MHz trace, frequency markers and a timestamped comment](beacon-strength-plotter-vk5rse.jpg)
+
+*VK3FS monitoring VK5RSE over a 410 km path. The trace switches between 2 m and 70 cm and shows a timestamped listening note and the latest signal level. Captured in v1.0.9.*
+
+## New in v1.0.11
+
+- **Lighter live plotting** — The graph uses fewer drawing operations, and the 24-hour view refreshes at most once a second. Minimising suspends live graph redraws while radio sampling, alerts and recording continue.
+- **Yaesu USB CAT support** — The FTX-1 (Main receiver) and FT-891 can plot and record raw CAT meter counts (0–255), mark frequency changes and tune supported beacon presets in CW. CSV exports use the `raw_cat` column.
 
 ## New in v1.0.9
 
@@ -19,18 +26,20 @@ Beacon Strength Plotter is a Windows 10 and 11 program for monitoring and record
 
 ## Features
 
-- **Live Icom CI-V monitoring** — See signal strength, tuned frequency and connection status. Scroll through up to 24 hours of readings, zoom in on weak signals, pause or return to Live. Set the sampling interval, smoothing and S9 reference.
+- **Live radio monitoring** — See signal strength, tuned frequency and connection status. Scroll through up to 24 hours of readings, zoom in on weak signals, pause or return to Live. Set the sampling interval, smoothing and S9 reference.
 - **Band colours and frequency markers** — Follow different bands on one plot. Dashed markers identify frequency changes, with the beacon callsign shown when known.
-- **Save and share** — Save and reopen plots, export timestamped raw CI-V readings to CSV, or copy a screenshot.
+- **Save and share** — Save and reopen plots, export timestamped raw meter readings to CSV, or copy a screenshot.
 - **Beacon presets and VKSpotter** — Manage colour-coded presets, tune to a saved frequency in CW, and look up or import multiple frequencies from VKSpotter.
 - **Distance, bearing and terrain** — Use Maidenhead locators to calculate distance and true bearing. Open the path in **OK1CDJ PathProfile** without a subscription, API key or configuration. **Google Maps and elevation** uses your Google Maps API key and offers KML export.
 - **Propagation charts** — Automatically fetch the latest Bureau of Meteorology synoptic chart, use a custom chart image URL, or open your preferred Hepburn forecast.
 - **Radio auto-connect** — Discover Windows USB and virtual COM ports and retry after an unexpected connection loss.
 - **Display, help and updates** — Show your callsign in the title, choose Day, Night or Auto mode, open the guides from **Help**, and check for new releases in **Setup**.
 
-## Supported Icom radios
+## Supported radios
 
-Built-in CI-V presets are available for the **IC-905, IC-9700, IC-705, IC-7300, IC-7300MK2, IC-7610 and IC-7760**. For other compatible Icom radios, select **Custom Icom** and enter your radio’s CI-V address.
+**Icom.** Built-in CI-V presets are available for the **IC-905, IC-9700, IC-705, IC-7300, IC-7300MK2, IC-7610 and IC-7760**. For other compatible Icom radios, select **Custom Icom** and enter your radio’s CI-V address.
+
+**Yaesu.** Select **Yaesu FTX-1** or **Yaesu FT-891**, choose the Enhanced USB CAT COM port and match the radio’s CAT baud rate. Use CAT-1 with one stop bit on the FTX-1. On the FT-891, disable CAT RTS and select VFO mode before tuning presets. Yaesu profiles use raw counts while calibration is pending. The mute control and dBm lift alerts are unavailable for these profiles.
 
 ## Install
 

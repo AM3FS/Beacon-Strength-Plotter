@@ -1,10 +1,11 @@
-"""Standalone receive S-meter history for Icom CI-V radios."""
+"""Standalone receive S-meter history for Icom and Yaesu radios."""
 from bisect import bisect_left, bisect_right
 from collections import deque
 import csv
 import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
+from functools import partial
 from html.parser import HTMLParser
 from io import BytesIO
 import json
@@ -28,6 +29,7 @@ from station_location import beacon_path, country_at, maidenhead_coordinates
 from updates import APP_VERSION, check_latest_release
 from vkspotter import BEACONS_URL, clipboard_beacons, fetch_beacons, listed_frequency_hz
 from vkspotter_credentials import forget_login, read_login, save_login
+from yaesu_cat import YAESU_MODELS, YaesuCAT, open_cat_port, supports_frequency
 
 RADIO_ADDRESSES = {
     'IC-905': 'AC',
@@ -39,6 +41,7 @@ RADIO_ADDRESSES = {
     'IC-7760': 'B2',
     'Custom Icom': '',
 }
+RADIO_MODELS = (*RADIO_ADDRESSES, *YAESU_MODELS)
 DEFAULT_RADIO = 'IC-9700'
 DEFAULT_SYNOPTIC_CHART = 'https://reg.bom.gov.au/fwo/IDY00030.202611211800.png'
 BOM_SYNOPTIC_PAGE = 'https://reg.bom.gov.au/australia/charts/synoptic_col.shtml'
@@ -55,6 +58,7 @@ TIME_WINDOWS = (
     (43200, '12 hr', 60), (86400, '24 hr', 60),
 )
 HISTORY_SECONDS = TIME_WINDOWS[-1][0]
+LONG_VIEW_REDRAW_INTERVAL = 1.0
 PLOT_BOTTOM_MARGIN = 34
 PLOT_STAGGERED_BOTTOM_MARGIN = 44
 Y_ZOOM_TOP = 14
@@ -280,7 +284,7 @@ def read_plot(path):
     reading_size = formats[data['format']]
     model = data.get('radio_model')
     samples = data.get('samples')
-    if not isinstance(model, str) or model not in RADIO_ADDRESSES or not isinstance(samples, list) or not samples:
+    if not isinstance(model, str) or model not in RADIO_MODELS or not isinstance(samples, list) or not samples:
         raise ValueError('The plot file is missing its radio model or readings.')
     history = deque()
     previous = 0
@@ -292,7 +296,7 @@ def read_plot(path):
         callsign = point[3] if reading_size == 4 else None
         if (type(stamp) not in (int, float) or not previous <= stamp < 253402214400
                 or (raw is not None and (type(raw) is not int or not 0 <= raw <= 255))):
-            raise ValueError('The plot file contains an invalid timestamp or CI-V reading.')
+            raise ValueError('The plot file contains an invalid timestamp or meter reading.')
         if hz is not None and (type(hz) is not int or not 0 < hz < 10**12):
             raise ValueError('The plot file contains an invalid frequency.')
         if callsign is not None and (not isinstance(callsign, str) or not callsign.isprintable()):
@@ -315,10 +319,10 @@ def read_plot(path):
     return model, history, comments
 
 
-def write_plot_csv(path, samples):
+def write_plot_csv(path, samples, model=DEFAULT_RADIO):
     with path.open('w', newline='', encoding='utf-8') as stream:
         writer = csv.writer(stream)
-        writer.writerow(('timestamp_utc', 'raw_ci_v'))
+        writer.writerow(('timestamp_utc', 'raw_cat' if model in YAESU_MODELS else 'raw_ci_v'))
         for timestamp, raw, _, _callsign in samples:
             writer.writerow((datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec='milliseconds'), raw))
 
@@ -481,23 +485,28 @@ class SetupDialog(simpledialog.Dialog):
         axis.pack(fill='x', padx=10, pady=(8, 0))
         choices = ttk.Frame(axis)
         choices.pack(fill='x')
-        for units in AXIS_UNITS:
-            ttk.Radiobutton(choices, text=units, value=units, variable=self.axis_units,
-                            command=self.update_reference_state).pack(side='left', padx=(0, 8))
-        reference = ttk.Frame(axis)
-        reference.pack(fill='x', pady=(5, 0))
-        ttk.Label(reference, text='S9 reference').pack(side='left', padx=(0, 6))
-        self.reference_picker = ttk.Combobox(reference, textvariable=self.dbm_reference,
-                                             values=tuple(DBM_REFERENCES), width=19)
-        self.reference_picker.pack(side='left')
         self.link_font = font.nametofont('TkDefaultFont', root=self).copy()
         self.link_font.configure(underline=True)
-        self.reference_link = ttk.Label(reference, text='Learn more', cursor='hand2',
-                                        takefocus=True, font=self.link_font)
-        self.reference_link.pack(side='left', padx=(8, 0))
-        for sequence in ('<Button-1>', '<Return>', '<space>'):
-            self.reference_link.bind(sequence, self.open_s9_reference)
-        self.update_reference_state()
+        self.reference_link = None
+        raw_cat = self.parent.plot_model in YAESU_MODELS
+        if raw_cat:
+            ttk.Label(choices, text='Yaesu plots use raw CAT meter counts (0–255).').pack(anchor='w')
+        else:
+            for units in AXIS_UNITS:
+                ttk.Radiobutton(choices, text=units, value=units, variable=self.axis_units,
+                                command=self.update_reference_state).pack(side='left', padx=(0, 8))
+            reference = ttk.Frame(axis)
+            reference.pack(fill='x', pady=(5, 0))
+            ttk.Label(reference, text='S9 reference').pack(side='left', padx=(0, 6))
+            self.reference_picker = ttk.Combobox(reference, textvariable=self.dbm_reference,
+                                                 values=tuple(DBM_REFERENCES), width=19)
+            self.reference_picker.pack(side='left')
+            self.reference_link = ttk.Label(reference, text='Learn more', cursor='hand2',
+                                            takefocus=True, font=self.link_font)
+            self.reference_link.pack(side='left', padx=(8, 0))
+            for sequence in ('<Button-1>', '<Return>', '<space>'):
+                self.reference_link.bind(sequence, self.open_s9_reference)
+            self.update_reference_state()
         smoothing = ttk.Frame(axis)
         smoothing.pack(fill='x', pady=(5, 0))
         ttk.Label(smoothing, text='Smoothing').pack(side='left', padx=(0, 6))
@@ -591,7 +600,8 @@ class SetupDialog(simpledialog.Dialog):
         self.configure(background=palette['background'])
         self.body_frame.configure(background=palette['background'])
         link_colour = '#8cd7ff' if self.parent.active_theme == 'Night' else '#125b91'
-        self.reference_link.configure(foreground=link_colour)
+        if self.reference_link is not None:
+            self.reference_link.configure(foreground=link_colour)
         self.hepburn_link.configure(foreground=link_colour)
         self.transparency_slider.configure(background=palette['background'], foreground=palette['text'],
                                            troughcolor=palette['panel'], activebackground=palette['hover'])
@@ -800,11 +810,38 @@ def visible_trace_segment(start, end, top):
     return x1, y1, x2, y2
 
 
+def draw_trace(canvas, points, top, *, width=2):
+    # Send contiguous sections of the same colour to Tk as one canvas item.
+    # Limit path size so long traces remain safe for Windows Tk drawing.
+    path = []
+    previous = None
+    stroke = None
+    for point, colour in points:
+        if previous is not None and point == previous:
+            continue
+        segment = visible_trace_segment(previous, point, top) if previous and point else None
+        if path and (segment is None or colour != stroke or (path[-2] != segment[0] or path[-1] != segment[1])
+                     or len(path) >= 1024):
+            canvas.create_line(*path, fill=stroke, width=width, joinstyle='round')
+            path.clear()
+        if segment is not None:
+            if not path:
+                path.extend(segment[:2])
+                stroke = colour
+            path.extend(segment[2:])
+        elif previous is None and point is not None and point[1] >= top:
+            x, height = point[:2]
+            canvas.create_oval(x - 1, height - 1, x + 1, height + 1, fill=colour, outline='')
+        previous = point
+    if path:
+        canvas.create_line(*path, fill=stroke, width=width, joinstyle='round')
+
+
 def radio_setup(settings):
     model = settings.get('model', DEFAULT_RADIO)
-    if not isinstance(model, str) or model not in RADIO_ADDRESSES:
+    if not isinstance(model, str) or model not in RADIO_MODELS:
         model = DEFAULT_RADIO
-    return model, settings.get('address', RADIO_ADDRESSES[model])
+    return model, settings.get('address', RADIO_ADDRESSES.get(model, ''))
 
 
 
@@ -813,13 +850,17 @@ def startup_radio(settings, model, ports):
     if saved is None and ports.get(model):
         # Earlier versions only saved a per-model port after a valid meter reply.
         saved = {'model': model, 'port': ports[model], 'baud': settings.get('baud', '115200'),
-                 'address': settings.get('address', RADIO_ADDRESSES[model])}
+                 'address': settings.get('address', RADIO_ADDRESSES.get(model, ''))}
     if not isinstance(saved, dict):
         return None
     try:
-        if saved['model'] not in RADIO_ADDRESSES or not isinstance(saved['port'], str) or not saved['port'].strip():
+        if saved['model'] not in RADIO_MODELS or not isinstance(saved['port'], str) or not saved['port'].strip():
             return None
-        if int(saved['baud']) <= 0 or not 1 <= int(saved['address'], 16) < 0xE0:
+        if int(saved['baud']) <= 0:
+            return None
+        if saved['model'] in YAESU_MODELS:
+            return {**saved, 'address': ''}
+        if not 1 <= int(saved['address'], 16) < 0xE0:
             return None
     except (KeyError, TypeError, ValueError):
         return None
@@ -1429,13 +1470,24 @@ def set_radio_mute(port, address, pending, previous_volume):
     return current if previous_volume is None and current != zero else None
 
 
-def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, sample_interval):
+def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, sample_interval,
+                 model=DEFAULT_RADIO):
     import serial
 
     port_failed = False
     try:
-        with serial.Serial(port_name, baud, timeout=0.1, write_timeout=0.5) as port:
+        yaesu = model in YAESU_MODELS
+        connection = (open_cat_port(serial, port_name, baud) if yaesu else
+                      serial.Serial(port_name, baud, timeout=0.1, write_timeout=0.5))
+        with connection as port:
             pending = bytearray()
+            if yaesu:
+                cat = YaesuCAT(port, model)
+                meter_reader, frequency_reader, tuner = cat.read_meter, cat.read_frequency, cat.tune_beacon
+            else:
+                meter_reader = partial(read_meter, port, address, pending)
+                frequency_reader = partial(read_frequency, port, address, pending)
+                tuner = partial(tune_beacon, port, address, pending)
             next_frequency = 0.0
             frequency = None
             last_sample = float("-inf")
@@ -1447,7 +1499,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     kind, argument = radio_requests.get_nowait()
                 except Empty:
                     kind, argument = None, None
-                if kind == 'audio':
+                if kind == 'audio' and not yaesu:
                     try:
                         restore_level = set_radio_mute(port, address, pending, argument)
                     except ValueError as exc:
@@ -1464,7 +1516,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     beacon = argument
                     events.put(('plot_gap', time.monotonic()))
                     try:
-                        tune_beacon(port, address, pending, beacon['hz'])
+                        tuner(beacon['hz'])
                     except ValueError as exc:
                         frequency = None
                         next_frequency = 0.0
@@ -1486,7 +1538,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     was_paused = False
                 sample = None
                 if started - last_sample >= sample_interval():
-                    value = read_meter(port, address, pending)
+                    value = meter_reader()
                     if pause.is_set():
                         was_paused = True
                         continue
@@ -1497,7 +1549,7 @@ def sample_radio(port_name, baud, address, stop, pause, events, radio_requests, 
                     frequency = None
                     if meter_available:
                         try:
-                            frequency = read_frequency(port, address, pending)
+                            frequency = frequency_reader()
                         except ValueError:
                             pass
                     events.put(('frequency', frequency))
@@ -1702,6 +1754,8 @@ class Plotter(tk.Tk):
         self.time_offset = time.time() - time.monotonic()
         self.loaded_plot = False
         self.last_draw = None
+        self.last_draw_at = float('-inf')
+        self.footer_contents = None
         self.view_end = None
         self.stop = None
         self.radio_responding = False
@@ -1736,8 +1790,12 @@ class Plotter(tk.Tk):
         self.auto_connect_job = None
         self.current_hz = None
         self.tuned_beacon = None
-        self.baud = tk.StringVar(value=settings.get('baud', '115200'))
         model, address = radio_setup(settings)
+        self.selected_radio = model
+        saved_bauds = settings.get('radio_bauds', {})
+        self.radio_bauds = saved_bauds if isinstance(saved_bauds, dict) else {}
+        default_baud = '38400' if model in YAESU_MODELS else '115200'
+        self.baud = tk.StringVar(value=settings.get('baud', default_baud))
         saved_ports = settings.get('radio_ports', {})
         self.radio_ports = saved_ports if isinstance(saved_ports, dict) else {}
         self.last_connected_radio = startup_radio(settings, model, self.radio_ports)
@@ -1789,8 +1847,8 @@ class Plotter(tk.Tk):
                 self.station_coordinates = maidenhead_coordinates(self.station_locator)
             except ValueError:
                 self.station_locator = ''
-        self.status = tk.StringVar(value='Select the radio and its CI-V COM port.')
-        self.readout = tk.StringVar(value='Raw CI-V  —')
+        self.status = tk.StringVar(value='Select the radio and its COM port.')
+        self.readout = tk.StringVar(value=f'{self.raw_meter_label}  —')
         saved_interval = settings.get('sample_interval_seconds')
         self.sample_interval = float(saved_interval) if saved_interval in SAMPLE_INTERVALS else 0.5
         self.frequency = tk.StringVar(value=format_radio_frequency(None))
@@ -1812,7 +1870,7 @@ class Plotter(tk.Tk):
         radio_panel.rowconfigure(0, minsize=40)
         radio_panel.grid(row=1, column=0, sticky='nsew', padx=(22, 4), pady=(0, 6))
         self.radio_picker = ttk.Combobox(radio_panel, textvariable=self.model,
-                                        values=tuple(RADIO_ADDRESSES), width=16, state='readonly')
+                                        values=RADIO_MODELS, width=16, state='readonly')
         self.radio_picker.grid(row=1, column=0, padx=(10, 12), sticky='ew')
         radio_labels = [('Radio model', self.radio_picker)]
         self.radio_picker.bind('<<ComboboxSelected>>', self.change_radio)
@@ -1827,6 +1885,7 @@ class Plotter(tk.Tk):
             field.grid(row=1, column=column, padx=(0, 12), sticky='ew')
             self.inputs.append(field)
             radio_labels.append((label, field))
+        self.update_address_field()
         self.inputs[0].configure(postcommand=self.refresh_ports)
         self.refresh = ttk.Button(radio_panel, text='Refresh ports', command=self.refresh_ports)
         self.refresh.grid(row=2, column=0, sticky='w', padx=(10, 0), pady=(5, 8))
@@ -1938,6 +1997,7 @@ class Plotter(tk.Tk):
         self.history_scroll = ttk.Scrollbar(self, orient='horizontal', command=self.scroll_history)
         self.history_scroll.grid(row=5, column=0, columnspan=2, sticky='ew', padx=22)
         self.chart.bind('<Configure>', lambda event: self.draw())
+        self.chart.bind('<Map>', lambda event: self.after_idle(self.draw))
         self.footer = tk.Canvas(self, width=1, height=34, highlightthickness=0)
         self.footer.grid(row=6, column=0, columnspan=2, sticky='ew', padx=22, pady=(6, 18))
         self.setup_panels += ((self.footer, self.footer, None, ()),)
@@ -2286,9 +2346,10 @@ class Plotter(tk.Tk):
             return
         beacons = {}
         for beacon in self.beacons:
-            beacons.setdefault(beacon['hz'], beacon)
+            if supports_frequency(self.model.get(), beacon['hz']):
+                beacons.setdefault(beacon['hz'], beacon)
         if len(beacons) < 2:
-            messagebox.showinfo('Scan beacons', 'Save at least two beacon frequencies first.', parent=self)
+            messagebox.showinfo('Scan beacons', 'Save at least two frequencies supported by this radio.', parent=self)
             return
         result = ScanDialog(self, beacons, self.scan_frequencies, self.scan_dwell).result
         if result is None or self.stop is None or self.stop.is_set():
@@ -2426,13 +2487,35 @@ class Plotter(tk.Tk):
 
     def change_radio(self, _event):
         model = self.model.get()
+        previous = self.selected_radio
+        self.radio_bauds[previous] = self.baud.get()
+        self.selected_radio = model
         self.port.set(self.radio_ports.get(model, ''))
-        address = RADIO_ADDRESSES[model]
+        if model in YAESU_MODELS:
+            default_baud = '38400'
+        else:
+            default_baud = self.radio_bauds.get(previous, '115200') if previous in RADIO_ADDRESSES else '115200'
+        self.baud.set(self.radio_bauds.get(model, default_baud))
+        self.update_address_field()
+        address = RADIO_ADDRESSES.get(model)
         if address:
             self.address.set(address)
         if not self.history:
-            self.plot_model = self.model.get()
+            self.plot_model = model
+            self.readout.set(f'{self.raw_meter_label}  —')
             self.draw()
+
+    @property
+    def raw_meter_label(self):
+        return 'Raw CAT' if self.plot_model in YAESU_MODELS else 'Raw CI-V'
+
+    def update_address_field(self):
+        if self.model.get() in YAESU_MODELS:
+            self.inputs[2].grid_remove()
+        else:
+            self.inputs[2].grid()
+        if hasattr(self, 'setup_panels') and hasattr(self, 'chart'):
+            self.after_idle(self.update_backdrop)
 
     def change_window(self, _value):
         span, label, _ = TIME_WINDOWS[self.window_index.get()]
@@ -2505,14 +2588,17 @@ class Plotter(tk.Tk):
         elapsed = abs(second[0] - first[0])
         if first[2] != second[2] and first[2] is not None and second[2] is not None:
             return f'A → B: {elapsed:.1f} s · different frequencies'
-        if self.axis_units.get() != 'dBm' and self.plot_model == 'Custom Icom':
+        if self.plot_model in YAESU_MODELS or (self.axis_units.get() != 'dBm' and self.plot_model == 'Custom Icom'):
             delta = second[1] - first[1]
-            return f'A → B: {elapsed:.1f} s · {delta:+d} raw CI-V counts'
+            return f'A → B: {elapsed:.1f} s · {delta:+d} {self.raw_meter_label.lower()} counts'
         positions = IC9700_POSITIONS if self.plot_model == 'IC-9700' else STANDARD_POSITIONS
         delta = positions[second[1]] - positions[first[1]]
         return f'A → B: {elapsed:.1f} s · {delta:+.1f} dB'
 
     def configure_lift_alert(self):
+        if self.model.get() in YAESU_MODELS:
+            messagebox.showinfo('Beacon lift alert', 'dBm thresholds require a calibrated meter scale.', parent=self)
+            return
         index = self.beacon_picker.current()
         if not 0 <= index < len(self.beacons):
             messagebox.showinfo('Beacon lift alert', 'Select a saved beacon frequency first.', parent=self)
@@ -2536,6 +2622,8 @@ class Plotter(tk.Tk):
         return f'{beacon_callsign_key(callsign)}:{hz}' if callsign and hz is not None else None
 
     def check_lift(self, sample):
+        if self.plot_model in YAESU_MODELS:
+            return
         stamp, raw, hz, callsign = sample
         key = self.lift_key(hz, callsign)
         rule = self.lift_alerts.get(key)
@@ -2739,9 +2827,12 @@ class Plotter(tk.Tk):
         if not saved:
             return
         self.model.set(saved['model'])
+        self.selected_radio = saved['model']
+        self.update_address_field()
         self.port.set(saved['port'])
         self.baud.set(saved['baud'])
-        self.address.set(saved['address'])
+        if saved['model'] in RADIO_ADDRESSES:
+            self.address.set(saved['address'])
         self.retry_radio_auto_connect(time.monotonic() + AUTO_CONNECT_WINDOW, preserve_history)
 
     def retry_radio_auto_connect(self, deadline, preserve_history):
@@ -2755,7 +2846,8 @@ class Plotter(tk.Tk):
             self.status.set(f'Auto-connect timed out on {self.port.get()}. Click Connect to try again.')
             return
         saved = self.last_connected_radio
-        if (self.model.get(), self.port.get(), self.baud.get(), self.address.get()) != (
+        address = self.address.get() if self.model.get() in RADIO_ADDRESSES else ''
+        if (self.model.get(), self.port.get(), self.baud.get(), address) != (
             saved['model'], saved['port'], str(saved['baud']), saved['address'],
         ):
             self.status.set('Radio settings changed. Click Connect to use the new settings.')
@@ -2782,14 +2874,16 @@ class Plotter(tk.Tk):
             self.mute_button.configure(state='disabled')
             self.status.set('Disconnecting…')
             return
+        yaesu = self.model.get() in YAESU_MODELS
         try:
             port = self.port.get().strip()
             baud = int(self.baud.get())
-            address = int(self.address.get().strip(), 16)
-            if not port or baud <= 0 or not 1 <= address < 0xE0:
+            address = None if yaesu else int(self.address.get().strip(), 16)
+            if not port or baud <= 0 or (address is not None and not 1 <= address < 0xE0):
                 raise ValueError
         except ValueError:
-            messagebox.showwarning('Connection settings', 'Enter a COM port, baud rate and hex CI-V address.')
+            fields = 'the Enhanced COM port and CAT baud rate' if yaesu else 'a COM port, baud rate and hex CI-V address'
+            messagebox.showwarning('Connection settings', f'Enter {fields}.')
             return
         if self.loaded_plot and not messagebox.askokcancel(
             'Start live plot', 'Connecting will replace the displayed plot. Continue?', parent=self,
@@ -2806,7 +2900,7 @@ class Plotter(tk.Tk):
         self.loaded_plot = False
         self.plot_model = self.model.get()
         self.draw()
-        self.readout.set('Raw CI-V  —')
+        self.readout.set(f'{self.raw_meter_label}  —')
         self.stop = Event()
         self.radio_verified = False
         self.auto_connecting = automatic
@@ -2820,12 +2914,12 @@ class Plotter(tk.Tk):
         Thread(
             target=sample_radio,
             args=(port, baud, address, self.stop, self.pause, self.events, self.radio_requests,
-                  lambda: self.sample_interval),
+                  lambda: self.sample_interval, self.plot_model),
             daemon=True,
         ).start()
 
     def toggle_radio_mute(self):
-        if self.stop is None or self.stop.is_set() or self.audio_pending:
+        if self.stop is None or self.stop.is_set() or self.audio_pending or self.plot_model in YAESU_MODELS:
             return
         self.audio_pending = True
         self.mute_button.configure(state='disabled')
@@ -2863,11 +2957,14 @@ class Plotter(tk.Tk):
                         if not self.pause.is_set():
                             self.check_lift(sample)
                     self.set_radio_responding(value is not None and self.stop is not None and not self.stop.is_set())
-                    self.readout.set(f"Raw CI-V  {'—' if value is None else value}")
+                    self.readout.set(f"{self.raw_meter_label}  {'—' if value is None else value}")
                     if not self.tuning and not self.pause.is_set():
-                        self.status.set('No meter reply. Check the radio’s COM port, baud and address.'
+                        connection = ('Enhanced COM port and CAT baud rate' if self.plot_model in YAESU_MODELS
+                                      else 'COM port, baud and address')
+                        self.status.set(f'No meter reply. Check the radio’s {connection}.'
                                         if value is None else f'Receiving meter readings every {self.sample_interval:g} s.')
-                    if value is not None and not self.audio_pending and not self.stop.is_set():
+                    if (value is not None and not self.audio_pending and not self.stop.is_set()
+                            and self.plot_model in RADIO_ADDRESSES):
                         self.mute_button.configure(state='normal')
                     self.remember_port(value)
                 elif kind == 'frequency':
@@ -2885,7 +2982,8 @@ class Plotter(tk.Tk):
                         self.tuned_beacon = payload['hz'], payload['callsign']
                         self.show_frequency(payload['hz'])
                         suffix = ' · paused' if self.pause.is_set() else ''
-                        self.status.set(f"Tuned to {payload['callsign']} · CW / Filter 1{suffix}")
+                        mode = 'CW' if self.plot_model in YAESU_MODELS else 'CW / Filter 1'
+                        self.status.set(f"Tuned to {payload['callsign']} · {mode}{suffix}")
                         self.schedule_scan_step()
                     elif kind == 'tune_failed':
                         self.stop_scan()
@@ -2906,7 +3004,7 @@ class Plotter(tk.Tk):
                     self.set_radio_responding(False)
                     self.status.set(f"Could not auto-connect on {self.port.get()}. {payload}"
                                     if self.auto_connecting else payload)
-                    self.readout.set('Raw CI-V  —')
+                    self.readout.set(f'{self.raw_meter_label}  —')
                 elif kind == 'closed':
                     recover = payload and self.auto_connect and self.radio_verified and not self.stop.is_set()
                     self.stop_scan()
@@ -2934,7 +3032,7 @@ class Plotter(tk.Tk):
                     self.tuning = False
                     self.beacon_picker.configure(state='readonly')
                     self.show_frequency(None)
-                    self.readout.set('Raw CI-V  —')
+                    self.readout.set(f'{self.raw_meter_label}  —')
                     self.draw()
                     self.connect.configure(text='Connect', state='normal')
                     self.radio_picker.configure(state='readonly')
@@ -2945,7 +3043,11 @@ class Plotter(tk.Tk):
         except Empty:
             pass
         if self.history and self.last_draw != self.history[-1]:
-            self.draw()
+            if self.state() == 'iconic' or not self.chart.winfo_viewable():
+                self.prune_plot_history(self.latest_time())
+            elif (TIME_WINDOWS[self.window_index.get()][0] != HISTORY_SECONDS
+                  or time.monotonic() - self.last_draw_at >= LONG_VIEW_REDRAW_INTERVAL):
+                self.draw()
         self.after(250, self.poll)
 
     def update_footer(self, *_args):
@@ -2953,7 +3055,6 @@ class Plotter(tk.Tk):
             return
         width, height = self.footer.winfo_width(), self.footer.winfo_height()
         colour = DISPLAY_THEMES[self.active_theme]['text']
-        self.footer.delete('readouts')
         status = self.measurement_status() or self.status.get()
         if self.alert_status and time.monotonic() < self.alert_status[0]:
             status = self.alert_status[1]
@@ -2963,9 +3064,15 @@ class Plotter(tk.Tk):
             status += ' · Daily recording armed' if self.stop is None else ' · Daily recording'
         if self.scan_beacons:
             status += ' · Scanning'
+        readout = self.readout.get()
+        contents = width, height, colour, status, readout
+        if contents == self.footer_contents:
+            return
+        self.footer_contents = contents
+        self.footer.delete('readouts')
         self.footer.create_text(12, height / 2, text=status, anchor='w',
                                 fill=colour, tags='readouts')
-        self.footer.create_text(width - 12, height / 2, text=self.readout.get(), anchor='e',
+        self.footer.create_text(width - 12, height / 2, text=readout, anchor='e',
                                 fill=colour, tags='readouts')
 
     def draw_clocks(self):
@@ -3027,6 +3134,7 @@ class Plotter(tk.Tk):
         self.loaded_plot = True
         self.time_offset = 0
         self.plot_model = model
+        self.readout.set(f'{self.raw_meter_label}  —')
         self.view_end = None
         duration = history[-1][0] - history[0][0]
         index = next((i for i, (span, _, _) in enumerate(TIME_WINDOWS) if span >= duration),
@@ -3071,6 +3179,10 @@ class Plotter(tk.Tk):
         except (OSError, ValueError, RecursionError) as exc:
             messagebox.showwarning('Compare saved plots', str(exc), parent=self)
             return
+        if model != self.plot_model and (model in YAESU_MODELS or self.plot_model in YAESU_MODELS):
+            messagebox.showinfo('Compare saved plots', 'Compare raw CAT readings from the same radio model.',
+                                parent=self)
+            return
         matching = self.recording_frequencies(self.history) & self.recording_frequencies(samples)
         if not matching:
             messagebox.showinfo('Compare saved plots', 'The two plots have no matching recorded frequency.',
@@ -3107,7 +3219,7 @@ class Plotter(tk.Tk):
         if path is None:
             return
         try:
-            write_plot_csv(path, self.timestamped_samples())
+            write_plot_csv(path, self.timestamped_samples(), self.plot_model)
         except (OSError, ValueError, OverflowError) as exc:
             messagebox.showwarning('Export CSV', str(exc), parent=self)
 
@@ -3192,7 +3304,7 @@ class Plotter(tk.Tk):
         bounds = [(container.winfo_x(), container.winfo_y(), container.winfo_width(), container.winfo_height())
                   for container, _, _, _ in panels]
         heading = self.plotter_heading
-        key = (theme, width, height, bounds, heading)
+        key = (theme, width, height, bounds, heading, self.model.get() in YAESU_MODELS)
         if key == self.backdrop_key or min(width, height) < 2:
             return
         self.backdrop_key = key
@@ -3267,12 +3379,24 @@ class Plotter(tk.Tk):
                 panel.create_text(title_x, 11, text=title, anchor='w', fill=palette['text'],
                                   font=('Segoe UI', 9, 'bold'))
             for label, widget in labels:
+                if not widget.winfo_manager():
+                    continue
                 panel.create_text(widget.winfo_x(), 29, text=label, anchor='w', fill=palette['text'])
 
+        self.footer_contents = None
         self.update_footer()
         self.draw_clocks()
         self.render_plot_wallpaper()
         self.draw()
+
+    def prune_plot_history(self, latest):
+        if self.loaded_plot:
+            return
+        cutoff = latest - HISTORY_SECONDS
+        while self.history and self.history[0][0] < cutoff:
+            self.history.popleft()
+        if self.plot_comments:
+            self.plot_comments = {stamp: text for stamp, text in self.plot_comments.items() if stamp >= cutoff}
 
     def draw(self):
         theme = self.active_theme
@@ -3283,13 +3407,10 @@ class Plotter(tk.Tk):
         if canvas.wallpaper_photo is not None:
             canvas.create_image(0, 0, image=canvas.wallpaper_photo, anchor='nw', tags='wallpaper')
         latest = self.latest_time()
-        while not self.loaded_plot and self.history and latest - self.history[0][0] > HISTORY_SECONDS:
-            self.history.popleft()
-        if not self.loaded_plot and self.plot_comments:
-            self.plot_comments = {stamp: text for stamp, text in self.plot_comments.items()
-                                  if stamp >= latest - HISTORY_SECONDS}
+        self.prune_plot_history(latest)
         self.clear_plot_button.configure(state='normal' if self.history else 'disabled')
         self.last_draw = self.history[-1] if self.history else None
+        self.last_draw_at = time.monotonic()
         span, _, interval = TIME_WINDOWS[self.window_index.get()]
         oldest = self.oldest_plot_time(latest)
         available = latest - oldest
@@ -3323,7 +3444,10 @@ class Plotter(tk.Tk):
         ticks = METER_TICKS
         reference = None
         axis_title = 'Approx. signal strength  ·  dB above S9'
-        if self.axis_units.get() == 'dBm':
+        if self.plot_model in YAESU_MODELS:
+            positions, ticks = RAW_POSITIONS, RAW_TICKS
+            axis_title = 'Raw CAT meter level (0–255)'
+        elif self.axis_units.get() == 'dBm':
             reference = DBM_REFERENCES[self.dbm_reference.get()]
             ticks = dbm_ticks(reference)
             axis_title = f'Estimated signal strength (dBm) · S9 = {reference} dBm'
@@ -3411,30 +3535,27 @@ class Plotter(tk.Tk):
                 level = '↑ ' + level
             label_y = min(bottom - 9, max(top + 9, height))
 
-        previous = None
-        previous_hz = None
-        for column, segments in columns.items():
-            for segment in segments:
-                if segment is None:
-                    previous = None
-                    continue
-                hz, first, low, high, last = segment
-                if previous_hz != hz:
-                    previous = None
-                previous_hz = hz
-                band_colour = band_colours.get(beacon_band(hz))
-                for raw in (first, low, high, last):
-                    point = (column, y(positions[raw]), raw)
-                    if point == previous:
+        def trace_points():
+            previous_hz = None
+            previous_raw = None
+            for column, segments in columns.items():
+                for segment in segments:
+                    if segment is None:
+                        previous_raw = None
+                        yield None, None
                         continue
-                    if previous is None and point[1] >= top:
-                        x, height, _ = point
-                        canvas.create_oval(x - 1, height - 1, x + 1, height + 1,
-                                           fill=band_colour or trace_colours[raw], outline='')
-                    elif previous is not None and (segment_on_screen := visible_trace_segment(previous, point, top)):
-                        colour = band_colour or trace_colours[round((previous[2] + raw) / 2)]
-                        canvas.create_line(*segment_on_screen, fill=colour, width=2)
-                    previous = point
+                    hz, first, low, high, last = segment
+                    if previous_hz != hz:
+                        previous_raw = None
+                        yield None, None
+                    previous_hz = hz
+                    band_colour = band_colours.get(beacon_band(hz))
+                    for raw in (first, low, high, last):
+                        level_index = raw if previous_raw is None else round((previous_raw + raw) / 2)
+                        yield (column, y(positions[raw]), raw), band_colour or trace_colours[level_index]
+                        previous_raw = raw
+
+        draw_trace(canvas, trace_points(), top)
 
         if self.comparison is not None:
             self.draw_comparison(y, count, positions is RAW_POSITIONS)
@@ -3566,8 +3687,9 @@ class Plotter(tk.Tk):
         if value is None:
             return
         port = self.port.get().strip()
-        connection = {'model': self.plot_model, 'port': port, 'baud': self.baud.get(),
-                      'address': self.address.get().strip()}
+        address = self.address.get().strip() if self.plot_model in RADIO_ADDRESSES else ''
+        connection = {'model': self.plot_model, 'port': port, 'baud': self.baud.get(), 'address': address}
+        self.radio_bauds[self.plot_model] = self.baud.get()
         if self.last_connected_radio != connection or self.radio_ports.get(self.plot_model) != port:
             self.last_connected_radio = connection
             self.radio_ports[self.plot_model] = port
@@ -3579,6 +3701,7 @@ class Plotter(tk.Tk):
                 'model': self.model.get(),
                 'display_theme': self.display_theme.get(),
                 'radio_ports': self.radio_ports,
+                'radio_bauds': {**self.radio_bauds, self.model.get(): self.baud.get()},
                 'last_connected_radio': self.last_connected_radio,
                 'beacons': self.beacons,
                 'baud': self.baud.get(),
